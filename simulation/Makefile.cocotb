@@ -1,0 +1,71 @@
+export ROOT := $(abspath ..)
+SIM_DIR := $(abspath .)
+COCOTB_VENV_BIN ?= /fs1/eecg/janders/iderikut/venv/fpu/bin
+export PATH := $(COCOTB_VENV_BIN):$(PATH)
+
+TOPLEVEL_LANG ?= verilog
+
+define get_sources
+$(shell grep -v '^\s*#' $(1) | sed 's|\$$ROOT|$(ROOT)|g')
+endef
+
+
+SIM ?= xcelium
+CMD ?= xrun
+TARGET ?= 6Ops
+
+# --- DUT selection define (mirrors Makefile) ---
+DEFINES :=
+VALID_TARGET := 0
+
+ifeq ($(TARGET),4Ops)
+  DEFINES += +define+FOUROPS
+  VALID_TARGET := 1
+endif
+
+ifeq ($(TARGET),6Ops)
+  DEFINES += +define+SIXOPS
+  VALID_TARGET := 1
+endif
+
+ifeq ($(TARGET),mixed_addmult)
+  DEFINES += +define+MIXED_ADDMULT
+  VALID_TARGET := 1
+endif
+
+ifeq ($(VALID_TARGET),0)
+  $(error Invalid TARGET: $(TARGET) (use 4Ops / 6Ops / mixed_addmult))
+endif
+
+
+# --- Source files ---
+VERILOG_SOURCES = $(call get_sources,$(SIM_DIR)/filelists/common_sv.f)
+VERILOG_SOURCES += $(call get_sources,$(SIM_DIR)/filelists/cocotb/$(TARGET)_sv.f)
+VHDL_SOURCES = $(call get_sources,$(SIM_DIR)/filelists/common_vhdl.f)
+
+
+TEST_UNIT ?= fp32_add
+
+# result folder
+SIM_BUILD := $(SIM_DIR)/build/$(SIM)/$(TARGET)/$(TEST_UNIT)_cocotb
+COCOTB_RESULTS_FILE := $(SIM_BUILD)/results.xml
+export SIM_BUILD COCOTB_RESULTS_FILE
+
+
+TOPLEVEL := $(TEST_UNIT)_wrapper
+MODULE := $(TEST_UNIT)_test
+
+export PYTHONPATH := $(ROOT)/src/tb/cocotb:$(PYTHONPATH)
+
+COCOTB_CONFIG ?= $(shell command -v cocotb-config 2>/dev/null || echo $(COCOTB_VENV_BIN)/cocotb-config)
+PYTHON_BIN := $(COCOTB_VENV_BIN)/python
+COCOTB_MAKEFILES_DIR := $(shell $(PYTHON_BIN) -m cocotb_tools.config --makefiles)
+SIM_LOWERCASE := $(shell echo $(SIM) | tr A-Z a-z)
+XCELIUM_BIN_DIR ?= .
+
+EXTRA_ARGS += -64bit -sv -v200x -access +rwc $(DEFINES)
+
+include $(COCOTB_MAKEFILES_DIR)/Makefile.inc
+include $(COCOTB_MAKEFILES_DIR)/simulators/Makefile.$(SIM_LOWERCASE)
+
+override CMD := xrun

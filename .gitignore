@@ -1,0 +1,44 @@
+# Simulation build outputs
+simulation/build/
+simulation/xcelium.d/
+simulation/xrun.*
+*.vcd
+*.fst
+*.fsdb
+*.wlf
+*.vpd
+results.xml
+
+# Simulator scratch/log files
+/xrun.*
+/xcelium.d/
+INCA_libs/
+work/
+transcript
+*.jou
+*.key
+*.log
+
+# Synopsys Design Compiler outputs
+synopsysDC/library_setup.local.tcl
+synopsysDC/library_setup.tcl
+synopsysDC/run-*/
+synopsysDC/WORK/
+synopsysDC/default.svf
+synopsysDC/command.log
+synopsysDC/filenames.log
+*.svf
+*.ddc
+*.sdc
+*.sdf
+*.rpt
+
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor/OS noise
+.DS_Store
+*~
+*.swp
