@@ -24,7 +24,7 @@ module FpAllShared(
 
     logic [7:0] expDiff_h;
     logic [7:0] expDiff_l;
-    logic [3:0] expDiff_3;
+    logic [3:0] expDiff_3, expDiff_2, expDiff_1, expDiff_0;  // FP8x4 per-lane exp diffs
 
     FpVec_u newX, newY;
     logic [7:0] add_expX_h,add_expX_l;
@@ -33,8 +33,10 @@ module FpAllShared(
     logic [23:0] mantissaY;
     logic [7:0] mantissaY_h, mantissaY_l;
     logic shiftedOut_h, shiftedOut_l;
+    logic shiftedOut_2, shiftedOut_1, shiftedOut_0;  // FP8x4 lanes (shiftedOut_h = lane3)
     logic [4:0] shiftVal_h_fp32;
     logic [3:0] shiftVal_h_fp16, shiftVal_l_fp16;
+    logic [2:0] shiftVal_3_fp8, shiftVal_2_fp8, shiftVal_1_fp8, shiftVal_0_fp8;
     logic [7:0] shiftVal;
     logic [25:0] shiftedMantissaY;
     logic add_sticky_h, add_sticky_l;
@@ -450,7 +452,7 @@ module FpAllShared(
 
     // assign swap = swaps[1]; // Currently forcing FMT_FP32 behavior for swap as the rest of the logic isn't updated yet.
     // input swap so that |operandX|>|operandY|
-    always_comb begin : swap
+    always_comb begin : swap_sel
         newX.fp8x4.lane3 = (swap[3] == 1'b0) ? x.fp8x4.lane3 : y.fp8x4.lane3;
         newY.fp8x4.lane3 = (swap[3] == 1'b0) ? y.fp8x4.lane3 : x.fp8x4.lane3;
 
@@ -466,10 +468,27 @@ module FpAllShared(
     end
 
     /* Exponent Difference */
+    // The two 8-bit subtractors are shared across formats. In FMT_FP8 each one
+    // packs two 4-bit lane exponents ({hiLane, loLane}). This is safe because the
+    // per-lane swap guarantees expX >= expY in every lane, so the low-nibble
+    // subtraction never borrows into the high nibble (no carry-chain cut needed).
     always_comb begin : exponent_dif
+        expDiff_h = (fmt == FMT_FP8)
+            ? {newX.fp8x4.lane3[6:3], newX.fp8x4.lane2[6:3]}
+            - {newY.fp8x4.lane3[6:3], newY.fp8x4.lane2[6:3]}
+            : newX.fp32.exp - newY.fp32.exp;
+
+        expDiff_l = (fmt == FMT_FP8)
+            ? {newX.fp8x4.lane1[6:3], newX.fp8x4.lane0[6:3]}
+            - {newY.fp8x4.lane1[6:3], newY.fp8x4.lane0[6:3]}
+            : newX.bf16x2.lo[14:7] - newY.bf16x2.lo[14:7];
+
+        // FP8x4 per-lane exponent differences (sliced from the shared subtractors)
+        expDiff_3 = expDiff_h[7:4];
+        expDiff_2 = expDiff_h[3:0];
+        expDiff_1 = expDiff_l[7:4];
+        expDiff_0 = expDiff_l[3:0];
     end
-    assign expDiff_h = newX.fp32.exp - newY.fp32.exp;
-    assign expDiff_l = newX.bf16x2.lo[14:7] - newY.bf16x2.lo[14:7]; //lo expDiff
 
     /* Sign, Exponent, Fraction Decomposition */
     assign signX_h = newX.fp32.sign;
@@ -487,14 +506,26 @@ module FpAllShared(
     assign mantissaY_h = {1'b1, newY.bf16x2.hi[6:0]};
     assign mantissaY_l = {1'b1, newY.bf16x2.lo[6:0]};
 
+    always_comb begin: shift
     // FMT_FP32 shift amount (cap at 26)
-    assign shiftedOut_h   = (|expDiff_h[7:5]); // expDiff_h > 31
-    assign shiftVal_h_fp32 = shiftedOut_h ? 5'd26 : expDiff_h[4:0];
+        shiftedOut_h    = (fmt == FMT_FP8) ? (expDiff_3 > 4'd4) : (|expDiff_h[7:5]); // expDiff_h > 31
+        shiftVal_h_fp32 = shiftedOut_h ? 5'd26 : expDiff_h[4:0];
 
     // FMT_BF16 shift amount (cap at 10)
-    assign shiftedOut_l    = (expDiff_l > 9);
-    assign shiftVal_h_fp16 = (shiftedOut_h |expDiff_h[4]) ? 4'd10 : expDiff_h[3:0]; //expDiff_h > 16 (area -4)
-    assign shiftVal_l_fp16 = shiftedOut_l ? 4'd10 : expDiff_l[3:0];
+        shiftedOut_l    = (expDiff_l > 9);
+        shiftVal_h_fp16 = (shiftedOut_h |expDiff_h[4]) ? 4'd10 : expDiff_h[3:0]; //expDiff_h > 16 (area -4)
+        shiftVal_l_fp16 = shiftedOut_l ? 4'd10 : expDiff_l[3:0];
+
+    // FMT_FP8 shift amount (cap at 5; diff > 4 => fully shifted out)
+        shiftedOut_2 = (expDiff_2 > 4'd4);
+        shiftedOut_1 = (expDiff_1 > 4'd4);
+        shiftedOut_0 = (expDiff_0 > 4'd4);
+        shiftVal_3_fp8 = shiftedOut_h ? 3'd5 : expDiff_3[2:0];
+        shiftVal_2_fp8 = shiftedOut_2 ? 3'd5 : expDiff_2[2:0];
+        shiftVal_1_fp8 = shiftedOut_1 ? 3'd5 : expDiff_1[2:0];
+        shiftVal_0_fp8 = shiftedOut_0 ? 3'd5 : expDiff_0[2:0];
+    end
+
 
     always_comb begin
     if (fmt == FMT_FP32) begin
