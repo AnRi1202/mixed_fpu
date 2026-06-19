@@ -22,10 +22,15 @@ package FpuPkg;
     localparam int BF16_EXP_WIDTH  = 8;
     localparam int BF16_FRAC_WIDTH = 7;
 
+    localparam int FP8_WIDTH       = 8;
+    localparam int FP8_EXP_WIDTH  = 5;
+    localparam int FP8_FRAC_WIDTH = 2;
+
     // Floating-point format selector
-    typedef enum logic {
-        FMT_FP32 = 1'b0,
-        FMT_FP16 = 1'b1
+    typedef enum logic [1:0] {
+        FMT_FP32 = 2'b00,
+        FMT_BF16 = 2'b01,
+        FMT_FP8  = 2'b10
     } FpFmt_e;
 
     // Operation selector
@@ -35,6 +40,16 @@ package FpuPkg;
         FOP_SQRT = 2'b10,
         FOP_DIV  = 2'b11
     } FpOp_e;
+
+    // FP8 view
+    typedef union packed {
+        logic [7:0] raw;
+        struct packed {
+            logic       sign;
+            logic [3:0] exp;
+            logic [2:0] frac;
+        } FP8;
+    } Fp8_u;
 
     // BF16 view
     typedef union packed {
@@ -50,12 +65,20 @@ package FpuPkg;
     typedef union packed {
         logic [31:0]  raw;
         struct packed {
+            logic [7:0] lane3;
+            logic [7:0] lane2;
+            logic [7:0] lane1;
+            logic [7:0] lane0;
+        } fp8x4;
+
+        struct packed {
             logic [15:0] hi;
             logic [15:0] lo;
-        } lanes;
+        } bf16x2;
+
         struct packed {
-            logic       sign;
-            logic [7:0] exp;
+            logic        sign;
+            logic [7:0]  exp;
             logic [22:0] frac;
         } fp32;
     } FpVec_u;

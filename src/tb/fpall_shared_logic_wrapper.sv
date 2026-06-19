@@ -8,7 +8,7 @@ import FpuPkg::*;
 module fpall_shared_logic_wrapper(
     input  logic        clk,
     input  logic [1:0]  opcode_in, // 00:Add, 01:Mul, 10:Sqrt, 11:Div
-    input  logic        fmt_in,    // 0:FMT_FP32, 1:FMT_FP16
+    input  logic        fmt_in,    // 0:FMT_FP32, 1:FMT_BF16
     input  logic [31:0] X,
     input  logic [31:0] Y,
     output logic [31:0] R

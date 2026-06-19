@@ -4,7 +4,7 @@ import FpuPkg::*;
 module Fpu4OpsComb(
     input  logic                    clk,
     input  FpOp_e                   opcode, // FOP_ADD / FOP_MUL / FOP_SQRT / FOP_DIV
-    input  FpFmt_e                  fmt,    // FMT_FP32 / FMT_FP16
+    input  FpFmt_e                  fmt,    // FMT_FP32 / FMT_BF16
     input  logic [FP32_WIDTH-1:0]   operandX,
     input  logic [FP32_WIDTH-1:0]   operandY,
     output logic [FP32_WIDTH-1:0]   result

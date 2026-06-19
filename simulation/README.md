@@ -57,8 +57,6 @@ make -f Makefile.cocotb TARGET=4Ops TEST_UNIT=fp32_add
 | `fp32_mult` | `fp32_mult_test.py` | `fp32_mult_wrapper` |
 | `bf16_add` | `bf16_add_test.py` | `bf16_add_wrapper` |
 | `bf16_mult` | `bf16_mult_test.py` | `bf16_mult_wrapper` |
-| `fp16_add` | `fp16_add_test.py` | `fp16_add_wrapper` |
-| `fp16_mult` | `fp16_mult_test.py` | `fp16_mult_wrapper` |
 
 ```bash
 # 例: bf16のaddテストを実行

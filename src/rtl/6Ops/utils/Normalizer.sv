@@ -2,7 +2,7 @@
 import FpuPkg::*;
 /*
 ===============================================================================
-Normalizer (Leading-Zero count_o + Left Shift) for Shared FMT_FP32 / Dual-FMT_FP16 Datapath
+Normalizer (Leading-Zero count_o + Left Shift) for Shared FMT_FP32 / Dual-FMT_BF16 Datapath
 -------------------------------------------------------------------------------
 Normalizes the post-add fraction by:
   1) Leading-zero count (LZC)
@@ -15,7 +15,7 @@ FMT_FP32 mode (single 28-bit lane):
 [1]    : rnd 
 [0]    : stk (actual value from add_sticky_l)
 
-FMT_FP16 mode (dual 14-bit lanes, after fracSticky assignment):
+FMT_BF16 mode (dual 14-bit bf16x2, after fracSticky assignment):
 High lane [27:14] (14 bits):
     [27]    : padding_h
     [26:19] : frac_h (8-bit high lane fraction)
@@ -36,7 +36,7 @@ I/O:
   - Input  `operandX[27:0]` : concatenated fraction (includes sticky extension)
   - Output `result[27:0]` : normalized fraction
   - Output `countHi` : FP16x2 hi-lane LZC, or full 28-bit LZC in FMT_FP32
-  - Output `countLo` : valid only in FMT_FP16 mode (start at operandX[11])  
+  - Output `countLo` : valid only in FMT_BF16 mode (start at operandX[11])  
 
 Datapath:
   - FMT_FP32   : LZC(28) on `operandX[27:0]` then cross-lane shift -> `result[27:0]`
@@ -44,7 +44,7 @@ Datapath:
 
 Notes:
   - Cross-lane shifting occurs only in FMT_FP32 mode.
-  - FP16x2 lanes remain independent to reduce area/routing and avoid per-stage
+  - FP16x2 bf16x2 remain independent to reduce area/routing and avoid per-stage
     `fmt` multiplexers.
 ===============================================================================
 */
@@ -77,7 +77,7 @@ module Normalizer(
         
         // "stage4 on" condition: FMT_FP32 mode AND upper 16b are all-zero
         count4_h = ((fmt == FMT_FP32) &&  ~(|operandX[27:12]));
-        count4_l = 1'b0;   // Stage4 is FMT_FP32-only, and countLo is FMT_FP16-only
+        count4_l = 1'b0;   // Stage4 is FMT_FP32-only, and countLo is FMT_BF16-only
         {level4_h, level4_l} = ((fmt == FMT_FP32) && count4_h) ? {operandX[11:0], 16'b0} : operandX;
 
         // Stage 3: shift by 8

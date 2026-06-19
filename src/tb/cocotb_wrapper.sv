@@ -100,7 +100,7 @@ module bf16_add_wrapper (
   AddMulOnly u_dut (
     .clk      (i_clk),
     .opcode   (FOP_ADD),
-    .fmt      (FMT_FP16),
+    .fmt      (FMT_BF16),
     .operandX ({16'b0, i_operand_a}),
     .operandY ({16'b0, i_operand_b}),
     .result   (tmpResult)
@@ -109,7 +109,7 @@ module bf16_add_wrapper (
   FpAllShared u_dut (
     .clk      (i_clk),
     .opcode   (FOP_ADD),
-    .fmt      (FMT_FP16),
+    .fmt      (FMT_BF16),
     .operandX ({16'b0, i_operand_a}),
     .operandY ({16'b0, i_operand_b}),
     .result   (tmpResult)
@@ -135,7 +135,7 @@ module bf16_mult_wrapper (
   AddMulOnly u_dut (
     .clk      (i_clk),
     .opcode   (FOP_MUL),
-    .fmt      (FMT_FP16),
+    .fmt      (FMT_BF16),
     .operandX ({16'b0, i_a}),
     .operandY ({16'b0, i_b}),
     .result   (tmpResult)
@@ -144,7 +144,7 @@ module bf16_mult_wrapper (
   FpAllShared u_dut (
     .clk      (i_clk),
     .opcode   (FOP_MUL),
-    .fmt      (FMT_FP16),
+    .fmt      (FMT_BF16),
     .operandX ({16'b0, i_a}),
     .operandY ({16'b0, i_b}),
     .result   (tmpResult)

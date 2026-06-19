@@ -108,7 +108,7 @@ module tb_fpmult_bf16x2;
   task automatic run_one(input logic [31:0] x, input logic [31:0] y, input string tag="");
     logic [31:0] expR;
     begin
-      fmt    = FMT_FP16;
+      fmt    = FMT_BF16;
       opcode = FOP_MUL;
       X = x;
       Y = y;
@@ -157,7 +157,7 @@ module tb_fpmult_bf16x2;
 
   initial begin
     // init
-    fmt    = FMT_FP16;
+    fmt    = FMT_BF16;
     opcode = FOP_MUL;
     X = '0; Y = '0;
     repeat (LAT) @(posedge clk);

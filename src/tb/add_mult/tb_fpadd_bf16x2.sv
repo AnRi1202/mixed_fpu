@@ -108,7 +108,7 @@ module tb_fpadd_bf16x2;
   task automatic run_one(input logic [31:0] x, input logic [31:0] y, input string tag="");
     logic [31:0] expR;
     begin
-      fmt    = FMT_FP16;
+      fmt    = FMT_BF16;
       opcode = FOP_ADD;
       X = x;
       Y = y;
@@ -162,7 +162,7 @@ module tb_fpadd_bf16x2;
 
   initial begin
     // init
-    fmt    = FMT_FP16;
+    fmt    = FMT_BF16;
     opcode = FOP_ADD;
     X = '0; Y = '0;
     // -----------------------------
