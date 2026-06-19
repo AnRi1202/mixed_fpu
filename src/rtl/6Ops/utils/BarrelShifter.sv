@@ -3,11 +3,12 @@ import FpuPkg::*;
 
 /*
 ===============================================================================
-Barrel Shifter for Shared FMT_FP32 / Dual-FMT_BF16 Datapath
+Barrel Shifter for Shared FMT_FP32 / BF16x2 / FP8x4 Datapath
 -------------------------------------------------------------------------------
-This shifter is shared between:
-  - FMT_FP32   : single 26-bit fraction path
-  - FP16x2 : dual-lane segmented fraction path (lane isolation via a zero gap)
+One logarithmic right-shift network (stages 16/8/4/2/1) shared by:
+  - FMT_FP32 : 1 lane  (26-bit fraction path)
+  - FMT_BF16 : 2 lanes (bf16x2)
+  - FMT_FP8  : 4 lanes (fp8x4, E4M3: significand = 4 bits)
 
 Implementation note:
   - Logarithmic barrel shifter (staged shifts: 16/8/4/2/1).
@@ -45,105 +46,133 @@ Sticky outputs:
 module BarrelShifter(
     input  FpFmt_e    fmt,
     input  logic [23:0] operandX,
-    input  logic [7:0]  shiftAmount,
+    input  logic [11:0]  shiftAmount,
     output logic [25:0] result,
-    output logic        stickyHi,
-    output logic        stickyLo
+    output logic [3:0]  sticky
 );
-    // stage levels
-    logic [25:0] level5;
-    logic [12:0] level4_h, level4_l;
-    logic [12:0] level3_h, level3_l;
-    logic [12:0] level2_h, level2_l;
-    logic [12:0] level1_h, level1_l;
-    logic [12:0] level0_h, level0_l;
+  // stage levels (original naming, now full 26-bit, no _h/_l split)
+  logic [25:0] level5, level4, level3, level2, level1, level0;
+  logic stk0, stk1, stk2, stk3;
+  logic [25:0] shifted;
 
-    // stage sticky bits
-    logic stk4_h, stk4_l;
-    logic stk3_h, stk3_l;
-    logic stk2_h, stk2_l;
-    logic stk1_h, stk1_l;
-    logic stk0_h, stk0_l;
+  // per-lane sticky accumulators
+  logic stk0, stk1, stk2, stk3;
+
+      // per-lane shift amounts (only low bits used per fmt)
+      logic [4:0] st3, st2, st1, st0;
+
+
+
+    always_comb begin: set_steps
+        steps0 = '0; steps1 = '0; steps2 = '0; steps3 = '0;
+        unique case (fmt)
+            FMT_FP32: begin
+                steps0 = shiftAmount[4:0]; steps1 = steps0;
+                steps2 = steps0;           steps3 = steps0;
+            end
+            FMT_BF16: begin
+                steps0 = {1'b0, shiftAmount[3:0]}; steps1 = steps0;
+                steps2 = {1'b0, shiftAmount[7:4]}; steps3 = steps2;
+            end
+            FMT_FP8: begin
+                steps0 = {2'b0, shiftAmount[2:0]};
+                steps1 = {2'b0, shiftAmount[5:3]};
+                steps2 = {2'b0, shiftAmount[8:6]};
+                steps3 = {2'b0, shiftAmount[11:9]};
+            end
+            default: ;
+        endcase
+    end
+
+
+
+    // boundary propagation enable
+    //   propagate (lanes merge) when enabled, block (lanes isolated) when disabled
+    logic prop07, prop13, prop20;
+    always_comb begin: bit_propagation
+        prop07 = (fmt == FMT_FP8);
+        prop13 = (fmt != FMT_FP32);
+        prop20 = (fmt == FMT_FP8);
+    end
 
     // input widening (24b -> 26b)
     logic [25:0] X26;
-    assign X26 = {operandX, 2'b00};
-    assign level5  = X26;
+    always_comb begin: 
+      X26 = {operandX, 2'b00};
+      level5  = X26;
+      // =================== stage by 16 : level5 -> level4 ===================
+      shifted = level5 >> 16;
+      shifted[6:0]  = shifted[6:0]  & {7 {prop07}};
+      shifted[12:0] = shifted[12:0] & {13{prop13}};
+      shifted[19:4] = shifted[19:4] & {16{prop20}};
+      stk0 |=           steps0[4] & (|level5[6:0]);
+      stk1 |= !prop07 & steps1[4] & (|level5[12:7]);
+      stk2 |= !prop13 & steps2[4] & (|level5[19:13]);
+      stk3 |= !prop20 & steps3[4] & (|level5[25:20]);
+      level4[6:0]   = steps0[4] ? shifted[6:0]   : level5[6:0];
+      level4[12:7]  = steps1[4] ? shifted[12:7]  : level5[12:7];
+      level4[19:13] = steps2[4] ? shifted[19:13] : level5[19:13];
+      level4[25:20] = steps3[4] ? shifted[25:20] : level5[25:20];
+      // =================== stage by 8 : level4 -> level3 ===================
+      shifted = level4 >> 8;
+      shifted[6:0]   = shifted[6:0]   & {7{prop07}};
+      shifted[12:5]  = shifted[12:5]  & {8{prop13}};
+      shifted[19:12] = shifted[19:12] & {8{prop20}};
+      stk0 |=           steps0[3] & (|level4[6:0]);
+      stk1 |= !prop07 & steps1[3] & (|level4[12:7]);
+      stk2 |= !prop13 & steps2[3] & (|level4[19:13]);
+      stk3 |= !prop20 & steps3[3] & (|level4[25:20]);
+      level3[6:0]   = steps0[3] ? shifted[6:0]   : level4[6:0];
+      level3[12:7]  = steps1[3] ? shifted[12:7]  : level4[12:7];
+      level3[19:13] = steps2[3] ? shifted[19:13] : level4[19:13];
+      level3[25:20] = steps3[3] ? shifted[25:20] : level4[25:20];
+      // =================== stage by 4 : level3 -> level2 ===================
+      shifted = level3 >> 4;
+      shifted[6:3]   = shifted[6:3]   & {4{prop07}};
+      shifted[12:9]  = shifted[12:9]  & {4{prop13}};
+      shifted[19:16] = shifted[19:16] & {4{prop20}};
+      stk0 |=           steps0[2] & (|level3[3:0]);
+      stk1 |= !prop07 & steps1[2] & (|level3[10:7]);
+      stk2 |= !prop13 & steps2[2] & (|level3[16:13]);
+      stk3 |= !prop20 & steps3[2] & (|level3[23:20]);
+      level2[6:0]   = steps0[2] ? shifted[6:0]   : level3[6:0];
+      level2[12:7]  = steps1[2] ? shifted[12:7]  : level3[12:7];
+      level2[19:13] = steps2[2] ? shifted[19:13] : level3[19:13];
+      level2[25:20] = steps3[2] ? shifted[25:20] : level3[25:20];
+      // =================== stage by 2 : level2 -> level1 ===================
+      shifted = level2 >> 2;
+      shifted[6:5]   = shifted[6:5]   & {2{prop07}};
+      shifted[12:11] = shifted[12:11] & {2{prop13}};
+      shifted[19:18] = shifted[19:18] & {2{prop20}};
+      stk0 |=           steps0[1] & (|level2[1:0]);
+      stk1 |= !prop07 & steps1[1] & (|level2[8:7]);
+      stk2 |= !prop13 & steps2[1] & (|level2[14:13]);
+      stk3 |= !prop20 & steps3[1] & (|level2[21:20]);
+      level1[6:0]   = steps0[1] ? shifted[6:0]   : level2[6:0];
+      level1[12:7]  = steps1[1] ? shifted[12:7]  : level2[12:7];
+      level1[19:13] = steps2[1] ? shifted[19:13] : level2[19:13];
+      level1[25:20] = steps3[1] ? shifted[25:20] : level2[25:20];
+      // =================== stage by 1 : level1 -> level0 ===================
+      shifted = level1 >> 1;
+      shifted[6]  = shifted[6]  & prop07;
+      shifted[12] = shifted[12] & prop13;
+      shifted[19] = shifted[19] & prop20;
+      stk0 |=           steps0[0] & (level1[0]);
+      stk1 |= !prop07 & steps1[0] & (level1[7]);
+      stk2 |= !prop13 & steps2[0] & (level1[13]);
+      stk3 |= !prop20 & steps3[0] & (level1[20]);
+      level0[6:0]   = steps0[0] ? shifted[6:0]   : level1[6:0];
+      level0[12:7]  = steps1[0] ? shifted[12:7]  : level1[12:7];
+      level0[19:13] = steps2[0] ? shifted[19:13] : level1[19:13];
+      level0[25:20] = steps3[0] ? shifted[25:20] : level1[25:20];
 
-    // shift control
-    logic [4:0] steps_h, steps_l;
-    logic [12:0] level0_h_out;  
-
-    // Shift control
-    assign steps_h = (fmt == FMT_FP32) ? shiftAmount[4:0] : {1'b0, shiftAmount[7:4]};
-    assign steps_l = (fmt == FMT_FP32) ? shiftAmount[4:0] : {1'b0, shiftAmount[3:0]};
-
-    always_comb begin
-        // Stage 4: shift by 16 (FMT_FP32 only)
-        stk4_h  = 1'b0;
-        stk4_l  = (fmt == FMT_FP32) && shiftAmount[4] && (|level5[15:0]);
-
-        // Split 26-bit into two 13-bit halves and shift by 16 if enabled
-        {level4_h,level4_l} = steps_h[4] ? {16'b0, level5[25:16]} : level5[25:0];
-
-
-        // Stage 3: shift by 8
-        stk3_h   = (fmt == FMT_BF16) && steps_h[3] && (|level4_h[7:0]);
-        stk3_l   = stk4_l | (steps_l[3] & (|level4_l[7:0]));
-
-        // Upper half shift
-        level3_h = steps_h[3] ? {8'b0, level4_h[12:8]} : level4_h;
-        // Lower half shift
-        // if (fmt ==FMT_FP32) begin
-        //     level3_l = steps_l[3] ? {level4_h[7:0], level4_l[12:8]} : level4_l;
-        // end else begin
-        //     level3_l = steps_l[3] ? {8'b0, level4_l[12:8]} : level4_l;
-        // end
-
-        level3_l[12:5] = steps_l[3] ? (level4_h[7:0] & {8{fmt == FMT_FP32}}): level4_l[12:5];
-        level3_l[4:0] = steps_l[3] ? level4_l[12:8] : level4_l[4:0];
-
-        // Stage 2: shift by 4
-        stk2_h   = stk3_h | ((fmt == FMT_BF16) && steps_h[2] && (|level3_h[3:0]));
-        stk2_l   = stk3_l | (steps_l[2] & (|level3_l[3:0]));
-        level2_h = steps_h[2] ? {4'b0, level3_h[12:4]} : level3_h;
-        // if (fmt == FMT_FP32) begin
-        //     level2_l = steps_l[2] ? {level3_h[3:0], level3_l[12:4]} : level3_l;
-        // end else begin
-        //     level2_l = steps_l[2] ? {4'b0, level3_l[12:4]} : level3_l;
-        // end
-        level2_l[12:9] = steps_l[2] ? (level3_h[3:0] & {4{fmt == FMT_FP32}}): level3_l[12:9];
-        level2_l[8:0] = steps_l[2] ? level3_l[12:4] : level3_l[8:0];
-
-        // Stage 1: shift by 2
-        stk1_h   = stk2_h | ((fmt == FMT_BF16) && steps_h[1] && (|level2_h[1:0]));
-        stk1_l   = stk2_l | (steps_l[1] & (|level2_l[1:0]));
-        level1_h = steps_h[1] ? {2'b0, level2_h[12:2]} : level2_h;
-        // if (fmt == FMT_FP32) begin
-        //     level1_l = steps_l[1] ? {level2_h[1:0], level2_l[12:2]} : level2_l;
-        // end else begin
-        //     level1_l = steps_l[1] ? {2'b0, level2_l[12:2]} : level2_l;
-        // end
-        level1_l[12:11] = steps_l[1] ? (level2_h[1:0] & {2{fmt == FMT_FP32}}): level2_l[12:11];
-        level1_l[10:0] = steps_l[1] ? level2_l[12:2] : level2_l[10:0];
-
-        // Stage 0: shift by 1
-        stk0_h   = stk1_h | ((fmt == FMT_BF16) && steps_h[0] && (|level1_h[0]));
-        stk0_l   = stk1_l | (steps_l[0] & level1_l[0]);
-        level0_h = steps_h[0] ? {1'b0, level1_h[12:1]} : level1_h;
-        // if (fmt == FMT_FP32) begin
-        //     level0_l = steps_l[0] ? {level1_h[0], level1_l[12:1]} : level1_l;
-        // end else begin
-        //     level0_l = steps_l[0] ? {1'b0, level1_l[12:1]} : level1_l;
-        // end
-        level0_l[12] = steps_l[0] ? (level1_h[0] & {1{fmt == FMT_FP32}}): level1_l[12];
-        level0_l[11:0] = steps_l[0] ? level1_l[12:1] : level1_l[11:0];
-
-        // In FMT_BF16 mode, lower 3 bits of upper lane are masked (lane width = 10b)
-        level0_h_out = level0_h;
-        if (fmt == FMT_BF16) level0_h_out[2:0] = 3'b0;
-        result = {level0_h_out, level0_l};
-
+        if (fmt == FMT_BF16) begin
+          stk2 |= |level0[15:13];
+          level0[15:13] = 3'b0;
+        end
+        if (fmt == FMT_FP8) begin
+          stk3 = 
+        end
         stickyHi =(stk0_h | (|level0_h[2:0]));
         stickyLo = stk0_l;
         

@@ -22,9 +22,10 @@ package FpuPkg;
     localparam int BF16_EXP_WIDTH  = 8;
     localparam int BF16_FRAC_WIDTH = 7;
 
+    // FP8: E4M3
     localparam int FP8_WIDTH       = 8;
-    localparam int FP8_EXP_WIDTH  = 5;
-    localparam int FP8_FRAC_WIDTH = 2;
+    localparam int FP8_EXP_WIDTH  = 4;
+    localparam int FP8_FRAC_WIDTH = 3;
 
     // Floating-point format selector
     typedef enum logic [1:0] {
