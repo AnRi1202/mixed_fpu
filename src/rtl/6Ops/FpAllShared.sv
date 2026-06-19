@@ -21,8 +21,11 @@ module FpAllShared(
 
     // FPAdd signals
     logic [3:0] swap;
+
     logic [7:0] expDiff_h;
     logic [7:0] expDiff_l;
+    logic [3:0] expDiff_3;
+
     FpVec_u newX, newY;
     logic [7:0] add_expX_h,add_expX_l;
     logic signX_h, signY_h, EffSub_h;
@@ -41,6 +44,7 @@ module FpAllShared(
     logic [26:0] fracAddResult;
     logic [27:0] fracSticky;
     logic [4:0] nZerosNew_l, nZerosNew_h;
+    logic [4:0] nZerosNew [4];   // per-lane LZC from Normalizer (count[3]=hi/FP32, count[0]=lo)
     logic [27:0] shiftedFrac;
     logic [13:0] shiftedFrac_h, shiftedFrac_l;
     logic [8:0] extendedExpInc_h, extendedExpInc_l;
@@ -446,20 +450,24 @@ module FpAllShared(
 
     // assign swap = swaps[1]; // Currently forcing FMT_FP32 behavior for swap as the rest of the logic isn't updated yet.
     // input swap so that |operandX|>|operandY|
-    always_comb begin
-        newX.bf16x2.hi = (swap_h ==1'b0) ? x.bf16x2.hi : y.bf16x2.hi;
-        newY.bf16x2.hi = (swap_h ==1'b0) ? y.bf16x2.hi : x.bf16x2.hi;
+    always_comb begin : swap
+        newX.fp8x4.lane3 = (swap[3] == 1'b0) ? x.fp8x4.lane3 : y.fp8x4.lane3;
+        newY.fp8x4.lane3 = (swap[3] == 1'b0) ? y.fp8x4.lane3 : x.fp8x4.lane3;
 
-    if(fmt ==FMT_FP32) begin
-            newX.bf16x2.lo = (swap_h ==1'b0) ? x.bf16x2.lo : y.bf16x2.lo;
-            newY.bf16x2.lo = (swap_h ==1'b0) ? y.bf16x2.lo : x.bf16x2.lo;
-    end else begin
-        newX.bf16x2.lo = (swap_l ==1'b0) ? x.bf16x2.lo : y.bf16x2.lo;
-        newY.bf16x2.lo = (swap_l ==1'b0) ? y.bf16x2.lo : x.bf16x2.lo;
-        end
+        newX.fp8x4.lane2 = (swap[2] == 1'b0) ? x.fp8x4.lane2 : y.fp8x4.lane2;
+        newY.fp8x4.lane2 = (swap[2] == 1'b0) ? y.fp8x4.lane2 : x.fp8x4.lane2;
+
+        newX.fp8x4.lane1 = (swap[1] == 1'b0) ? x.fp8x4.lane1 : y.fp8x4.lane1;
+        newY.fp8x4.lane1 = (swap[1] == 1'b0) ? y.fp8x4.lane1 : x.fp8x4.lane1;
+
+        newX.fp8x4.lane0 = (swap[0] == 1'b0) ? x.fp8x4.lane0 : y.fp8x4.lane0;
+        newY.fp8x4.lane0 = (swap[0] == 1'b0) ? y.fp8x4.lane0 : x.fp8x4.lane0;
+
     end
 
     /* Exponent Difference */
+    always_comb begin : exponent_dif
+    end
     assign expDiff_h = newX.fp32.exp - newY.fp32.exp;
     assign expDiff_l = newX.bf16x2.lo[14:7] - newY.bf16x2.lo[14:7]; //lo expDiff
 
@@ -550,10 +558,13 @@ module FpAllShared(
         .clk(clk),
         .fmt(fmt),
         .operandX(fracSticky),
-        .countHi(nZerosNew_h),
-        .countLo(nZerosNew_l),
+        .count(nZerosNew),
         .result(shiftedFrac)
     );
+
+    // hi-lane / FP32 use count[3]; lo-lane uses count[0]
+    assign nZerosNew_h = nZerosNew[3];
+    assign nZerosNew_l = nZerosNew[0];
 
     // Exponent Update
     assign extendedExpInc_h = {1'b0, add_expX_h} + 9'd1;
