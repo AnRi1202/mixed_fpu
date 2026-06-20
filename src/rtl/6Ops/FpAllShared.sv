@@ -28,8 +28,10 @@ module FpAllShared(
 
     FpVec_u newX, newY;
     logic [7:0] add_expX_h,add_expX_l;
-    logic signX_h, signY_h, EffSub_h;
-    logic signX_l, signY_l, EffSub_l;
+    // Sign
+    logic [3:0] signX, signY;
+    // Effective subtraction
+    logic [3:0] EffSub;
     logic [23:0] significandY;
     logic [7:0] significandY_h, significandY_l;
     logic [3:0] significandY3, significandY2, significandY1, significandY0;
@@ -40,9 +42,9 @@ module FpAllShared(
     logic [2:0] shiftVal_3_fp8, shiftVal_2_fp8, shiftVal_1_fp8, shiftVal_0_fp8;
     logic [11:0] shiftVal;
     logic [25:0] shiftedMantissaY;
-    logic add_sticky_h, add_sticky_l;
+    logic [3:0] add_sticky;
     logic [26:0] mantissaYpad, EffSub_Vector, mantissaYpadXorOp, mantissaXpad;
-    logic cInSigAdd_h, cInSigAdd_l;
+    logic [27:0] fracAddSum;
     logic [26:0] cin_vec;
     logic [26:0] fracAddResult;
     logic [27:0] fracSticky;
@@ -507,17 +509,19 @@ module FpAllShared(
 
     /* Sign, Exponent, Fraction Decomposition */
     always_comb begin
-        signX_h = newX.fp32.sign;
-        signY_h = newY.fp32.sign;
-        signX_l = newX.bf16x2.lo[15];
-        signY_l = newY.bf16x2.lo[15];
+        signX[3] = newX.fp32.sign;
+        signY[3] = newY.fp32.sign;
+        signX[2] = newX.fp8x4.lane2[7];
+        signY[2] = newY.fp8x4.lane2[7];
+        signX[1] = newX.bf16x2.lo[15];
+        signY[1] = newY.bf16x2.lo[15];
+        signX[0] = newX.fp8x4.lane0[7];
+        signY[0] = newY.fp8x4.lane0[7];
 
         add_expX_h = newX.fp32.exp; // == newX.bf16x2.hi[14:8];
         add_expX_l = newX.bf16x2.lo[14:7];
 
-        EffSub_h = signX_h ^ signY_h;
-        EffSub_l = signX_l ^ signY_l;
-
+        EffSub = signX ^ signY; // Calculate each sign bit
 
         significandY_h = {1'b1, newY.bf16x2.hi[6:0]};
         significandY_l = {1'b1, newY.bf16x2.lo[6:0]};
@@ -568,16 +572,13 @@ module FpAllShared(
         endcase
     end
 
-    logic [3:0] barrel_sticky;
     BarrelShifter right_shifter_component (
         .fmt(fmt),
         .shiftAmount(shiftVal),
         .operandX(significandY),
         .result(shiftedMantissaY),
-        .sticky(barrel_sticky)
+        .sticky(add_sticky)
     );
-    assign add_sticky_l = barrel_sticky[0]; // FP32 global / BF16 lo
-    assign add_sticky_h = barrel_sticky[2]; // BF16 hi
     /* --- Significand Addition Prep --- */
 
     // ** Bit Layout (27-bit) [mantissaYpad, EffSub_Vector, mantissaXpad] **:
@@ -586,37 +587,95 @@ module FpAllShared(
     // [15:11] Gap/Zero:  {00000}
     // [10: 0] Lane Low:  {padding(2), frac(7), guard, rnd}
     always_comb begin
-        mantissaYpad = {1'b0, shiftedMantissaY}; // align to 27b adder input (MSB pad)
-        EffSub_Vector = (fmt == FMT_FP32) ? {27{EffSub_h}} : { {11{EffSub_h}}, 5'd0, {11{EffSub_l}} };
+        // ---- Y significand placed into the 27b adder layout ----
+        // FP32/BF16 : {MSB pad, BarrelShifter output}.
+        // FP8       : re-map the BarrelShifter's 6b lanes into Normalizer-aligned
+        //             7b slots (L0=[6:0],L1=[13:7],L2=[20:14],L3=[26:21]).
+        //             Bits [6]/[13]/[20] are per-lane overflow/gap that isolate
+        //             adjacent lanes inside the shared 27b adder.
+        case (fmt)
+            FMT_FP8 : mantissaYpad = { shiftedMantissaY[25:20],
+                                       1'b0, shiftedMantissaY[18:13],
+                                       1'b0, shiftedMantissaY[12:7],
+                                       1'b0, shiftedMantissaY[5:0] };
+            default : mantissaYpad = {1'b0, shiftedMantissaY};
+        endcase
+
+        // ---- Effective-sub mask: flip only each lane's CONTENT bits ----
+        // The per-lane gap bit stays 0 so the 2's-complement carry stops there
+        // and never leaks into the neighbouring lane.
+        case (fmt)
+            FMT_FP32: EffSub_Vector = {27{EffSub[3]}};
+            FMT_BF16: EffSub_Vector = { {11{EffSub[3]}}, 5'b0, {11{EffSub[1]}} };
+            FMT_FP8 : EffSub_Vector = { {6{EffSub[3]}},
+                                        1'b0, {6{EffSub[2]}},
+                                        1'b0, {6{EffSub[1]}},
+                                        1'b0, {6{EffSub[0]}} };
+            default : EffSub_Vector = '0;
+        endcase
         mantissaYpadXorOp = mantissaYpad ^ EffSub_Vector;
 
-        mantissaXpad =
-        (fmt ==FMT_FP32) ? {2'b01, newX[22:0], 2'b00}
-            : {{2'b01,newX.bf16x2.hi[6:0],2'b0}, 3'b0, 2'b0 , {2'b01, newX.bf16x2.lo[6:0],2'b0}};
-            // same bit layout as mantissaYpad
+        // ---- X significand: same lane layout as mantissaYpad ----
+        case (fmt)
+            FMT_FP32: mantissaXpad = {2'b01, newX[22:0], 2'b00};
+            FMT_BF16: mantissaXpad = { {2'b01, newX.bf16x2.hi[6:0], 2'b0}, 3'b0, 2'b0,
+                                       {2'b01, newX.bf16x2.lo[6:0], 2'b0} };
+            FMT_FP8 : mantissaXpad = { {1'b1, newX.fp8x4.lane3[2:0], 2'b00},
+                                       1'b0, {1'b1, newX.fp8x4.lane2[2:0], 2'b00},
+                                       1'b0, {1'b1, newX.fp8x4.lane1[2:0], 2'b00},
+                                       1'b0, {1'b1, newX.fp8x4.lane0[2:0], 2'b00} };
+            default : mantissaXpad = '0;
+        endcase
 
-        cInSigAdd_h = EffSub_h & (~add_sticky_h);
-    // if we subtract and the sticky was one, some of the negated sticky bits would have absorbed this carry
-        cInSigAdd_l = (fmt ==FMT_FP32) ? EffSub_h & (~add_sticky_l):  EffSub_l & (~add_sticky_l);
-
-
-    // Connect to Shared IntAdder_27 (TODO: not conneced now. separated from other op)
         add_fracAdder_X = mantissaXpad;       // Connect padded operandX fraction
         add_fracAdder_Y = mantissaYpadXorOp;  // Connect prepared operandY fraction
 
-    // Vectorize Carry-in for Shared Adder
-        cin_vec =
-    (fmt == FMT_BF16) ? ((27'(cInSigAdd_l)) | (27'(cInSigAdd_h) << 16))
-                :  (27'(cInSigAdd_l));
+        // ---- Per-lane carry-in for effective subtraction (x + ~y + 1) ----
+        // cin sits at each lane's content LSB; ~sticky absorbs the case where a
+        // shifted-out bit already consumed the +1.
+        case (fmt)
+            FMT_FP32: cin_vec = 27'(EffSub[3] & ~add_sticky[0]);
+            FMT_BF16: cin_vec = 27'(EffSub[1] & ~add_sticky[0])
+                              | (27'(EffSub[3] & ~add_sticky[2]) << 16);
+            FMT_FP8 : cin_vec = 27'(EffSub[0] & ~add_sticky[0])
+                              | (27'(EffSub[1] & ~add_sticky[1]) << 7)
+                              | (27'(EffSub[2] & ~add_sticky[2]) << 14)
+                              | (27'(EffSub[3] & ~add_sticky[3]) << 21);
+            default : cin_vec = '0;
+        endcase
     end
 
     /* Execute Significand Addition/Subtraction */
-    assign fracAddResult = add_fracAdder_X + add_fracAdder_Y + cin_vec;
+    // 28b sum keeps the carry-out (FP8 lane3 overflow / general MSB overflow).
+    assign fracAddSum    = {1'b0, add_fracAdder_X} + {1'b0, add_fracAdder_Y} + {1'b0, cin_vec};
+    assign fracAddResult = fracAddSum[26:0];
 
     // Prepare Normalizer Input (Significand + Sticky)
     always_comb begin
-        fracSticky = {fracAddResult, add_sticky_l};
-        if(fmt ==FMT_BF16) fracSticky[16] = add_sticky_h;
+        case (fmt)
+            FMT_FP8 : begin
+                // adder 7b lanes -> Normalizer FP8 lanes (L0=[6:0],L1=[13:7],L2=[20:14],L3=[27:21])
+                fracSticky[6:0]   = fracAddResult[6:0];
+                fracSticky[13:7]  = fracAddResult[13:7];
+                fracSticky[20:14] = fracAddResult[20:14];
+                fracSticky[27:21] = {fracAddSum[27], fracAddResult[26:21]};
+                // pad/overflow bit is real only for effective-add; on effective-sub
+                // it merely holds the 2's-complement artifact, so clear it.
+                if (EffSub[0]) fracSticky[6]  = 1'b0;
+                if (EffSub[1]) fracSticky[13] = 1'b0;
+                if (EffSub[2]) fracSticky[20] = 1'b0;
+                if (EffSub[3]) fracSticky[27] = 1'b0;
+                // fold each lane's shifted-out sticky into its round/sticky LSB
+                fracSticky[0]  = fracSticky[0]  | add_sticky[0];
+                fracSticky[7]  = fracSticky[7]  | add_sticky[1];
+                fracSticky[14] = fracSticky[14] | add_sticky[2];
+                fracSticky[21] = fracSticky[21] | add_sticky[3];
+            end
+            default : begin
+                fracSticky = {fracAddResult, add_sticky[0]};
+                if (fmt == FMT_BF16) fracSticky[16] = add_sticky[2];
+            end
+        endcase
     end
 
     /* --- LZC and shifter --- */
@@ -677,14 +736,14 @@ module FpAllShared(
 
     // Pack Result (Sign, Exponent, Mantissa)
     assign add_R_fp32 = {
-        signX_h,
+        signX[3],
         add_RoundedExpFrac   // exp + frac (FMT_FP32)
     };
 
     assign add_R_fp16 = {
-        signX_h,
+        signX[3],
         add_RoundedExpFrac[30:16], // exp+frac high lane
-        signX_l,
+        signX[1],
         add_RoundedExpFrac[14:0]   // exp+frac low lane
     };
 
