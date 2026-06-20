@@ -22,12 +22,12 @@ module AbsComparator (
     logic [14:0] y_hi;
 
     always_comb begin
-        x_lo = operandX.lanes.lo;
-        x_hi = operandX.lanes.hi[14:0];
-        y_lo = operandY.lanes.lo;
-        y_hi = operandY.lanes.hi[14:0];
+        x_lo = operandX.bf16x2.lo;
+        x_hi = operandX.bf16x2.hi[14:0];
+        y_lo = operandY.bf16x2.lo;
+        y_hi = operandY.bf16x2.hi[14:0];
         
-        if (fmt == FMT_FP16) begin
+        if (fmt == FMT_BF16) begin
             x_lo[15] = 1'b0;
             y_lo[15] = 1'b0;
         end
@@ -40,7 +40,7 @@ module AbsComparator (
     assign c16    = sub_lo[16];
 
     logic cin_hi;
-    assign cin_hi = (fmt == FMT_FP16) ? 1'b1 : c16; // Key shared logic: carry propagation control
+    assign cin_hi = (fmt == FMT_BF16) ? 1'b1 : c16; // Key shared logic: carry propagation control
 
     logic [15:0] sub_hi;
     logic        c32;
@@ -50,5 +50,5 @@ module AbsComparator (
 
     // borrow = ~carry_out
     assign swapLo = ~c16; // lane.lo: a_lo < b_lo
-    assign swapHi = ~c32; // lane.hi (FMT_FP16) or entire 32-bit (FMT_FP32)
+    assign swapHi = ~c32; // lane.hi (FMT_BF16) or entire 32-bit (FMT_FP32)
 endmodule : AbsComparator

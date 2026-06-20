@@ -13,7 +13,7 @@ module FpAllShared(
     // for multiprecision
     // Design Policy:
     // When in FMT_FP32 mode, prioritize using the logic/resources associated with
-    // the high-order 16-bit lanes (FMT_FP16 high part) to maximize sharing.
+    // the high-order 16-bit lanes (FMT_BF16 high part) to maximize sharing.
     // ========================================================================
     FpVec_u x, y;
     assign x.raw = operandX;
@@ -448,43 +448,43 @@ module FpAllShared(
     // assign swap = swaps[1]; // Currently forcing FMT_FP32 behavior for swap as the rest of the logic isn't updated yet.
     // input swap so that |operandX|>|operandY|
     always_comb begin
-        newX.lanes.hi = (swap_h ==1'b0) ? x.lanes.hi : y.lanes.hi;
-        newY.lanes.hi = (swap_h ==1'b0) ? y.lanes.hi : x.lanes.hi;
+        newX.bf16x2.hi = (swap_h ==1'b0) ? x.bf16x2.hi : y.bf16x2.hi;
+        newY.bf16x2.hi = (swap_h ==1'b0) ? y.bf16x2.hi : x.bf16x2.hi;
 
     if(fmt ==FMT_FP32) begin
-            newX.lanes.lo = (swap_h ==1'b0) ? x.lanes.lo : y.lanes.lo;
-            newY.lanes.lo = (swap_h ==1'b0) ? y.lanes.lo : x.lanes.lo;
+            newX.bf16x2.lo = (swap_h ==1'b0) ? x.bf16x2.lo : y.bf16x2.lo;
+            newY.bf16x2.lo = (swap_h ==1'b0) ? y.bf16x2.lo : x.bf16x2.lo;
     end else begin
-        newX.lanes.lo = (swap_l ==1'b0) ? x.lanes.lo : y.lanes.lo;
-        newY.lanes.lo = (swap_l ==1'b0) ? y.lanes.lo : x.lanes.lo;
+        newX.bf16x2.lo = (swap_l ==1'b0) ? x.bf16x2.lo : y.bf16x2.lo;
+        newY.bf16x2.lo = (swap_l ==1'b0) ? y.bf16x2.lo : x.bf16x2.lo;
         end
     end
 
     /* Exponent Difference */
     assign expDiff_h = newX.fp32.exp - newY.fp32.exp;
-    assign expDiff_l = newX.lanes.lo[14:7] - newY.lanes.lo[14:7]; //lo expDiff
+    assign expDiff_l = newX.bf16x2.lo[14:7] - newY.bf16x2.lo[14:7]; //lo expDiff
 
     /* Sign, Exponent, Fraction Decomposition */
     assign signX_h = newX.fp32.sign;
     assign signY_h = newY.fp32.sign;
-    assign signX_l = newX.lanes.lo[15];
-    assign signY_l = newY.lanes.lo[15];
+    assign signX_l = newX.bf16x2.lo[15];
+    assign signY_l = newY.bf16x2.lo[15];
 
-    assign add_expX_h = newX.fp32.exp; // == newX.lanes.hi[14:8];
-    assign add_expX_l = newX.lanes.lo[14:7];
+    assign add_expX_h = newX.fp32.exp; // == newX.bf16x2.hi[14:8];
+    assign add_expX_l = newX.bf16x2.lo[14:7];
 
     assign EffSub_h = signX_h ^ signY_h;
     assign EffSub_l = signX_l ^ signY_l;
 
 
-    assign mantissaY_h = {1'b1, newY.lanes.hi[6:0]};
-    assign mantissaY_l = {1'b1, newY.lanes.lo[6:0]};
+    assign mantissaY_h = {1'b1, newY.bf16x2.hi[6:0]};
+    assign mantissaY_l = {1'b1, newY.bf16x2.lo[6:0]};
 
     // FMT_FP32 shift amount (cap at 26)
     assign shiftedOut_h   = (|expDiff_h[7:5]); // expDiff_h > 31
     assign shiftVal_h_fp32 = shiftedOut_h ? 5'd26 : expDiff_h[4:0];
 
-    // FMT_FP16 shift amount (cap at 10)
+    // FMT_BF16 shift amount (cap at 10)
     assign shiftedOut_l    = (expDiff_l > 9);
     assign shiftVal_h_fp16 = (shiftedOut_h |expDiff_h[4]) ? 4'd10 : expDiff_h[3:0]; //expDiff_h > 16 (area -4)
     assign shiftVal_l_fp16 = shiftedOut_l ? 4'd10 : expDiff_l[3:0];
@@ -520,7 +520,7 @@ module FpAllShared(
 
     assign mantissaXpad =
         (fmt ==FMT_FP32) ? {2'b01, newX[22:0], 2'b00}
-            : {{2'b01,newX.lanes.hi[6:0],2'b0}, 3'b0, 2'b0 , {2'b01, newX.lanes.lo[6:0],2'b0}};
+            : {{2'b01,newX.bf16x2.hi[6:0],2'b0}, 3'b0, 2'b0 , {2'b01, newX.bf16x2.lo[6:0],2'b0}};
             // same bit layout as mantissaYpad
 
     assign cInSigAdd_h = EffSub_h & (~add_sticky_h);
@@ -534,7 +534,7 @@ module FpAllShared(
 
     // Vectorize Carry-in for Shared Adder
     assign cin_vec =
-    (fmt == FMT_FP16) ? ((27'(cInSigAdd_l)) | (27'(cInSigAdd_h) << 16))
+    (fmt == FMT_BF16) ? ((27'(cInSigAdd_l)) | (27'(cInSigAdd_h) << 16))
                 :  (27'(cInSigAdd_l));
 
     /* Execute Significand Addition/Subtraction */
@@ -543,7 +543,7 @@ module FpAllShared(
     // Prepare Normalizer Input (Significand + Sticky)
     always_comb begin
         fracSticky = {fracAddResult, add_sticky_l};
-        if(fmt ==FMT_FP16) fracSticky[16] = add_sticky_h;
+        if(fmt ==FMT_BF16) fracSticky[16] = add_sticky_h;
     end
 
     /* --- LZC and shifter --- */
@@ -593,7 +593,7 @@ module FpAllShared(
 
     // Add: connect to Shared Rounding Adder
     assign round_vec =
-        (fmt == FMT_FP16) ? ((31'(add_round_l)) | (31'(add_round_h) << 16))
+        (fmt == FMT_BF16) ? ((31'(add_round_l)) | (31'(add_round_h) << 16))
                 :  (31'(add_round_l));
     assign add_ra_X = add_expFrac;
     assign add_ra_Y = round_vec;
@@ -635,26 +635,26 @@ module FpAllShared(
     // assign expSumPreSub = {1'b0, mul_expAdder_R[8:0]}; // Get addition result
 
     assign expSumPreSub_h = mult_x.fp32.exp + mult_y.fp32.exp;
-    assign expSumPreSub_l = mult_x.lanes.lo[14:7] + mult_y.lanes.lo[14:7];
+    assign expSumPreSub_l = mult_x.bf16x2.lo[14:7] + mult_y.bf16x2.lo[14:7];
     assign bias = 9'd127;
     assign expSum_h = expSumPreSub_h - bias;
     assign expSum_l = expSumPreSub_l - bias;
 
     assign sigX =
         (fmt ==FMT_FP32) ? {2'b01, mult_x.fp32.frac}
-            : { {1'b1, mult_x.lanes.hi[6:0]}, 9'b0, {1'b1, mult_x.lanes.lo[6:0]}};
+            : { {1'b1, mult_x.bf16x2.hi[6:0]}, 9'b0, {1'b1, mult_x.bf16x2.lo[6:0]}};
 
     assign sigY =
         (fmt ==FMT_FP32) ? {2'b01, mult_y.fp32.frac}
-            : { {1'b1, mult_y.lanes.hi[6:0]}, 9'b0, {1'b1, mult_y.lanes.lo[6:0]}};
+            : { {1'b1, mult_y.bf16x2.hi[6:0]}, 9'b0, {1'b1, mult_y.bf16x2.lo[6:0]}};
     always_comb begin
         sigProd = sigX * sigY;
     end
 
 
     // exponent update
-    assign norm_h = (fmt ==FMT_FP16) ? sigProd[49] : sigProd[47]; // 1x.xx...
-    assign norm_l = (fmt ==FMT_FP16) ? sigProd[15]: 1'b0; // 1x.xx...
+    assign norm_h = (fmt ==FMT_BF16) ? sigProd[49] : sigProd[47]; // 1x.xx...
+    assign norm_l = (fmt ==FMT_BF16) ? sigProd[15]: 1'b0; // 1x.xx...
 
     assign expPostNorm_h = expSum_h + {7'd0, norm_h};
     assign expPostNorm_l = expSum_l + {7'd0, norm_l};
@@ -689,7 +689,7 @@ module FpAllShared(
 
     // Select rounding carries for shared adder (ra_Cin for Low/FMT_FP32, mul_ra_Y for High)
     assign mult_round = (fmt == FMT_FP32) ? mult_round_32 : mult_round_l;
-    assign mul_ra_Y   = (fmt == FMT_FP16) ? (31'(mult_round_h) << 16) : 31'd0;
+    assign mul_ra_Y   = (fmt == FMT_BF16) ? (31'(mult_round_h) << 16) : 31'd0;
 
     // Connect to Shared Rounding Adder (31bit, area_opt同様)
     assign mul_ra_X = expSig[30:0];

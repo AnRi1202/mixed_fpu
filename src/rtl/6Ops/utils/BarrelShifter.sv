@@ -3,7 +3,7 @@ import FpuPkg::*;
 
 /*
 ===============================================================================
-Barrel Shifter for Shared FMT_FP32 / Dual-FMT_FP16 Datapath
+Barrel Shifter for Shared FMT_FP32 / Dual-FMT_BF16 Datapath
 -------------------------------------------------------------------------------
 This shifter is shared between:
   - FMT_FP32   : single 26-bit fraction path
@@ -17,7 +17,7 @@ Input packing expectation:
   - FMT_FP32 (fmt == FMT_FP32):
       `operandX` represents the single FMT_FP32 fraction payload.
       `X26` conceptually corresponds to { frac[23:0], guard, sticky }.
-  - FMT_FP16 (fmt == FMT_FP16):
+  - FMT_BF16 (fmt == FMT_BF16):
       FP16x2 is interpreted in the 26-bit widened vector `X26` (after
       `X26 = { operandX, 2'b00 }`) as two 10-bit lanes separated by a 6-bit zero gap:
         lane.hi -> X26[25:16] = { frac_hi[7:0], guard_hi, sticky_hi }
@@ -29,7 +29,7 @@ Input packing expectation:
 
 Shift amount encoding (`shiftAmount`):
   - FMT_FP32 : shift_amt = shiftAmount[4:0]  (0–31)
-  - FMT_FP16 : shift_hi  = shiftAmount[7:4]  (0–15), shift_lo = shiftAmount[3:0] (0–15)
+  - FMT_BF16 : shift_hi  = shiftAmount[7:4]  (0–15), shift_lo = shiftAmount[3:0] (0–15)
 
 Output (`result`):
   - `result[25:0]` is the shifted result in the same `X26` layout.
@@ -37,8 +37,8 @@ Output (`result`):
     - FP16x2: lane.hi in `result[25:16]`, zero gap in `result[15:10]`, lane.lo in `result[9:0]`
 
 Sticky outputs:
-  - stickyHi : valid only in FMT_FP16 mode (upper lane)
-  - stickyLo : FMT_FP32 = global sticky; FMT_FP16 = lower-lane sticky
+  - stickyHi : valid only in FMT_BF16 mode (upper lane)
+  - stickyLo : FMT_FP32 = global sticky; FMT_BF16 = lower-lane sticky
 ===============================================================================
 */
 
@@ -88,7 +88,7 @@ module BarrelShifter(
 
 
         // Stage 3: shift by 8
-        stk3_h   = (fmt == FMT_FP16) && steps_h[3] && (|level4_h[7:0]);
+        stk3_h   = (fmt == FMT_BF16) && steps_h[3] && (|level4_h[7:0]);
         stk3_l   = stk4_l | (steps_l[3] & (|level4_l[7:0]));
 
         // Upper half shift
@@ -104,7 +104,7 @@ module BarrelShifter(
         level3_l[4:0] = steps_l[3] ? level4_l[12:8] : level4_l[4:0];
 
         // Stage 2: shift by 4
-        stk2_h   = stk3_h | ((fmt == FMT_FP16) && steps_h[2] && (|level3_h[3:0]));
+        stk2_h   = stk3_h | ((fmt == FMT_BF16) && steps_h[2] && (|level3_h[3:0]));
         stk2_l   = stk3_l | (steps_l[2] & (|level3_l[3:0]));
         level2_h = steps_h[2] ? {4'b0, level3_h[12:4]} : level3_h;
         // if (fmt == FMT_FP32) begin
@@ -116,7 +116,7 @@ module BarrelShifter(
         level2_l[8:0] = steps_l[2] ? level3_l[12:4] : level3_l[8:0];
 
         // Stage 1: shift by 2
-        stk1_h   = stk2_h | ((fmt == FMT_FP16) && steps_h[1] && (|level2_h[1:0]));
+        stk1_h   = stk2_h | ((fmt == FMT_BF16) && steps_h[1] && (|level2_h[1:0]));
         stk1_l   = stk2_l | (steps_l[1] & (|level2_l[1:0]));
         level1_h = steps_h[1] ? {2'b0, level2_h[12:2]} : level2_h;
         // if (fmt == FMT_FP32) begin
@@ -128,7 +128,7 @@ module BarrelShifter(
         level1_l[10:0] = steps_l[1] ? level2_l[12:2] : level2_l[10:0];
 
         // Stage 0: shift by 1
-        stk0_h   = stk1_h | ((fmt == FMT_FP16) && steps_h[0] && (|level1_h[0]));
+        stk0_h   = stk1_h | ((fmt == FMT_BF16) && steps_h[0] && (|level1_h[0]));
         stk0_l   = stk1_l | (steps_l[0] & level1_l[0]);
         level0_h = steps_h[0] ? {1'b0, level1_h[12:1]} : level1_h;
         // if (fmt == FMT_FP32) begin
@@ -139,9 +139,9 @@ module BarrelShifter(
         level0_l[12] = steps_l[0] ? (level1_h[0] & {1{fmt == FMT_FP32}}): level1_l[12];
         level0_l[11:0] = steps_l[0] ? level1_l[12:1] : level1_l[11:0];
 
-        // In FMT_FP16 mode, lower 3 bits of upper lane are masked (lane width = 10b)
+        // In FMT_BF16 mode, lower 3 bits of upper lane are masked (lane width = 10b)
         level0_h_out = level0_h;
-        if (fmt == FMT_FP16) level0_h_out[2:0] = 3'b0;
+        if (fmt == FMT_BF16) level0_h_out[2:0] = 3'b0;
         result = {level0_h_out, level0_l};
 
         stickyHi =(stk0_h | (|level0_h[2:0]));

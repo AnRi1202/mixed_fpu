@@ -38,6 +38,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Accidental command-name files
+simulation/exit
+simulation/run
+simulation/source
+
 # Editor/OS noise
 .DS_Store
 *~

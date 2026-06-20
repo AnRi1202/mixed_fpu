@@ -33,8 +33,15 @@ ifeq ($(TARGET),mixed_addmult)
   VALID_TARGET := 1
 endif
 
+# fp8x4 multi-precision (FP32 / BF16x2 / FP8x4). Uses the FpAllShared module from
+# src/rtl/fp8x4/Fp8x4All.sv; the wrapper falls through to its default (SIXOPS) branch.
+ifeq ($(TARGET),fp8x4)
+  DEFINES += +define+FP8X4
+  VALID_TARGET := 1
+endif
+
 ifeq ($(VALID_TARGET),0)
-  $(error Invalid TARGET: $(TARGET) (use 4Ops / 6Ops / mixed_addmult))
+  $(error Invalid TARGET: $(TARGET) (use 4Ops / 6Ops / mixed_addmult / fp8x4))
 endif
 
 

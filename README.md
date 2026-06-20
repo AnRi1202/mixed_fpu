@@ -28,13 +28,9 @@ cd simulation
 make -f Makefile.cocotb TARGET=6Ops TEST_UNIT=fp32_add
 ```
 
-Common targets are:
+Available targets: `v2_1_bf16_add`, `v2_2_bf16_mult`, `4Ops`, `6Ops`, `fp8x4`, `mixed_addmult`.
 
-- `4Ops`
-- `6Ops`
-- `mixed_addmult`
-
-See `simulation/README.md` for more detailed simulation notes.
+See [simulation/README.md](simulation/README.md) for TARGET/TEST_UNIT options, waveform viewing, file locations, and how to add new targets or tests.
 
 ## Synthesis
 

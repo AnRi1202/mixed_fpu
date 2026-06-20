@@ -161,8 +161,8 @@ async def test_random_mult(dut):
         # Use smaller range to avoid overflow/underflow
         # FP32 exponent range is roughly 1e-38 to 1e38
         # To avoid overflow in multiplication, use sqrt of max range
-        a = random.uniform(-1.0e-30, 1.0e30)
-        b = random.uniform(-1.0e-30, 1.0e30)
+        a = random.uniform(-1.0e15, 1.0e15)
+        b = random.uniform(-1.0e15, 1.0e15)
 
         # Use single precision for reference calculation to match hardware
         a_sp = np.float32(a)

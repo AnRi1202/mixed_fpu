@@ -615,10 +615,8 @@ module FpAllShared(
         //             Bits [6]/[13]/[20] are per-lane overflow/gap that isolate
         //             adjacent lanes inside the shared 27b adder.
         case (fmt)
-            FMT_FP8 : mantissaYpad = { shiftedMantissaY[25:20],
-                                       1'b0, shiftedMantissaY[18:13],
-                                       1'b0, shiftedMantissaY[12:7],
-                                       1'b0, shiftedMantissaY[5:0] };
+            FMT_FP8 : mantissaYpad = { shiftedMantissaY[25:13],
+                                       1'b0, shiftedMantissaY[12:0] };
             default : mantissaYpad = {1'b0, shiftedMantissaY};
         endcase
 

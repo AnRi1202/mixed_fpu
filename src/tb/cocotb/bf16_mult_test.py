@@ -2,149 +2,132 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, Timer
 import numpy as np
+import random
 
-def float_to_bfloat16(f):
-    """Convert Python float to BF16 (Brain Float 16) format
-    Uses truncation (not RNE rounding) to match hardware behavior
-    """
-    fp32 = np.float32(f)
-    return int(fp32.view(np.uint32) >> 16)
+# ============================================================================
+# BF16 helpers  (sign(1) | exp(8, bias=127) | mantissa(7))
+# Uses RNE rounding to match hardware behavior.
+#
+# Tests drive BOTH lanes (hi=[31:16], lo=[15:0]) with independent pairs.
+# ============================================================================
 
-def bfloat16_to_float(h):
-    """Convert BF16 hex to Python float"""
+
+def float_to_bf16(f):
+    bits = int(np.float32(f).view(np.uint32))
+    rnd = (bits >> 15) & 1
+    sticky = bits & 0x7FFF
+    trunc = bits >> 16
+    if rnd and (sticky or (trunc & 1)):
+        trunc += 1
+    return trunc & 0xFFFF
+
+
+def bf16_to_float(h):
     fp32_bits = np.uint32(h & 0xFFFF) << 16
     return float(fp32_bits.view(np.float32))
 
 
-@cocotb.test()
-async def test_bf16_mult_pipeline(dut):
-    """Test the 3-stage BF16 multiplier with various multiplication cases"""
+def bf16_mult_ref(a_bits, b_bits):
+    p = np.float32(bf16_to_float(a_bits)) * np.float32(bf16_to_float(b_bits))
+    return float_to_bf16(float(p))
 
+
+def pack(lanes):
+    return ((lanes[1] & 0xFFFF) << 16) | (lanes[0] & 0xFFFF)
+
+
+def unpack(word, i):
+    return (word >> (16 * i)) & 0xFFFF
+
+
+async def _reset(dut):
     cocotb.start_soon(Clock(dut.i_clk, 10, unit="ns").start())
-
-    # Reset
     dut.i_rst_n.value = 0
-    dut.i_a.value = 0
-    dut.i_b.value = 0
+    dut.i_operand_a.value = 0
+    dut.i_operand_b.value = 0
     await Timer(20, unit="ns")
     dut.i_rst_n.value = 1
     await RisingEdge(dut.i_clk)
 
-    # Warm-up
-    dut.i_a.value = float_to_bfloat16(1.0)
-    dut.i_b.value = float_to_bfloat16(1.0)
-    for i in range(4):
+
+@cocotb.test()
+async def test_bf16x2_mult_directed(dut):
+    """Directed BF16x2 multiply, one independent (a,b) pair per lane."""
+    await _reset(dut)
+
+    cases = [
+        (2.0, 3.0),     # lo : 6.0
+        (-4.0, 2.0),    # hi : -8.0
+    ]
+
+    a_lanes = [float_to_bf16(a) for (a, _) in cases]
+    b_lanes = [float_to_bf16(b) for (_, b) in cases]
+
+    dut.i_operand_a.value = pack(a_lanes)
+    dut.i_operand_b.value = pack(b_lanes)
+    for _ in range(4):
         await RisingEdge(dut.i_clk)
 
-    # Test Case 1: Basic multiplication - 2.0 * 3.0 = 6.0
-    val_a = 2.0
-    val_b = 3.0
-    expected = val_a * val_b
-
-    dut.i_a.value = float_to_bfloat16(val_a)
-    dut.i_b.value = float_to_bfloat16(val_b)
-
-    for i in range(4):
-        await RisingEdge(dut.i_clk)
-
-    result_hex = dut.o_prod.value.to_unsigned()
-    result_float = bfloat16_to_float(result_hex)
-
-    dut._log.info(f"Test 1: {val_a} * {val_b} = {result_float} (expected {expected})")
-    assert abs(result_float - expected) < 1e-1, f"Failed: Expected {expected}, got {result_float}"
-
-    # Test Case 2: Negative multiplication
-    val_a = 4.0
-    val_b = -2.0
-    expected = val_a * val_b
-
-    dut.i_a.value = float_to_bfloat16(val_a)
-    dut.i_b.value = float_to_bfloat16(val_b)
-
-    for i in range(4):
-        await RisingEdge(dut.i_clk)
-
-    result_hex = dut.o_prod.value.to_unsigned()
-    result_float = bfloat16_to_float(result_hex)
-
-    dut._log.info(f"Test 2: {val_a} * {val_b} = {result_float} (expected {expected})")
-    assert abs(result_float - expected) < 1e-1, f"Failed: Expected {expected}, got {result_float}"
-
-    # Test Case 3: Fractional
-    val_a = 1.5
-    val_b = 2.5
-    expected = val_a * val_b
-
-    dut.i_a.value = float_to_bfloat16(val_a)
-    dut.i_b.value = float_to_bfloat16(val_b)
-
-    for i in range(4):
-        await RisingEdge(dut.i_clk)
-
-    result_hex = dut.o_prod.value.to_unsigned()
-    result_float = bfloat16_to_float(result_hex)
-
-    dut._log.info(f"Test 3: {val_a} * {val_b} = {result_float} (expected {expected})")
-    assert abs(result_float - expected) < 1e-1, f"Failed: Expected {expected}, got {result_float}"
+    res = dut.o_prod.value.to_unsigned()
+    for i, (a, b) in enumerate(cases):
+        exp_bits = bf16_mult_ref(a_lanes[i], b_lanes[i])
+        got_bits = unpack(res, i)
+        got = bf16_to_float(got_bits)
+        exp = bf16_to_float(exp_bits)
+        lane = "lo" if i == 0 else "hi"
+        dut._log.info(
+            f"lane_{lane}: {bf16_to_float(a_lanes[i])} * {bf16_to_float(b_lanes[i])} "
+            f"= {got} (expected {exp}), got=0x{got_bits:04X} exp=0x{exp_bits:04X}")
+        assert got_bits == exp_bits, \
+            f"lane_{lane} failed: {a}*{b} -> 0x{got_bits:04X} ({got}), expected 0x{exp_bits:04X} ({exp})"
 
 
 @cocotb.test()
-async def test_bf16_random_mult(dut):
-    """Feed random BF16 floats and check multiplication results"""
-    import random
+async def test_bf16x2_mult_random(dut):
+    """Random BF16x2 multiply; bit-accurate vs truncation reference, both lanes."""
+    await _reset(dut)
+    random.seed(0xB6)
 
-    cocotb.start_soon(Clock(dut.i_clk, 10, unit="ns").start())
+    n_checked = 0
+    for it in range(300):
+        a_lanes = [0, 0]
+        b_lanes = [0, 0]
+        exp_lanes = [None, None]
 
-    dut.i_rst_n.value = 0
-    dut.i_a.value = 0
-    dut.i_b.value = 0
-    await RisingEdge(dut.i_clk)
-    await RisingEdge(dut.i_clk)
-    dut.i_rst_n.value = 1
-    await RisingEdge(dut.i_clk)
+        for i in range(2):
+            for _ in range(20):
+                a = random.uniform(-1000.0, 1000.0)
+                b = random.uniform(-1000.0, 1000.0)
+                ab = float_to_bf16(a)
+                bb = float_to_bf16(b)
+                ref = bf16_mult_ref(ab, bb)
+                p = bf16_to_float(ab) * bf16_to_float(bb)
+                if p == 0.0:
+                    continue
+                a_lanes[i], b_lanes[i], exp_lanes[i] = ab, bb, ref
+                break
 
-    # BF16 has same range as FP32, use moderate values
-    for i in range(100):
-        a = random.uniform(-1000.0, 1000.0)
-        b = random.uniform(-1000.0, 1000.0)
+        dut.i_operand_a.value = pack(a_lanes)
+        dut.i_operand_b.value = pack(b_lanes)
+        await RisingEdge(dut.i_clk)
+        await RisingEdge(dut.i_clk)
 
-        a_bf16_hex = float_to_bfloat16(a)
-        b_bf16_hex = float_to_bfloat16(b)
-        a_bf16 = bfloat16_to_float(a_bf16_hex)
-        b_bf16 = bfloat16_to_float(b_bf16_hex)
+        res = dut.o_prod.value.to_unsigned()
+        for i in range(2):
+            if exp_lanes[i] is None:
+                continue
+            got_bits = unpack(res, i)
+            lane = "lo" if i == 0 else "hi"
+            if got_bits != exp_lanes[i] and n_checked < 40:
+                dut._log.warning(
+                    f"it{it} lane_{lane}: {bf16_to_float(a_lanes[i])} * {bf16_to_float(b_lanes[i])} "
+                    f"-> 0x{got_bits:04X} ({bf16_to_float(got_bits)}), "
+                    f"expected 0x{exp_lanes[i]:04X} ({bf16_to_float(exp_lanes[i])})")
+            assert got_bits == exp_lanes[i], (
+                f"it{it} lane_{lane} failed: 0x{a_lanes[i]:04X}*0x{b_lanes[i]:04X} -> "
+                f"0x{got_bits:04X} ({bf16_to_float(got_bits)}), "
+                f"expected 0x{exp_lanes[i]:04X} ({bf16_to_float(exp_lanes[i])})")
+            n_checked += 1
 
-        expected_fp32 = np.float32(a_bf16 * b_bf16)
-        expected = bfloat16_to_float(float_to_bfloat16(expected_fp32))
-
-        dut.i_a.value = a_bf16_hex
-        dut.i_b.value = b_bf16_hex
-
-        for _ in range(4):
-            await RisingEdge(dut.i_clk)
-
-        result_hex = dut.o_prod.value.to_unsigned()
-        got = bfloat16_to_float(result_hex)
-
-        import math
-        if math.isnan(expected) or math.isnan(got):
-            if math.isnan(expected) and math.isnan(got):
-                rel_error = 0.0
-            else:
-                rel_error = float('inf')
-        elif math.isinf(expected) or math.isinf(got):
-            if math.isinf(expected) and math.isinf(got) and (expected > 0) == (got > 0):
-                rel_error = 0.0
-            else:
-                rel_error = float('inf')
-        elif expected == 0 and got == 0:
-            rel_error = 0.0
-        elif expected != 0:
-            rel_error = abs(got - expected) / abs(expected)
-        else:
-            rel_error = abs(got - expected)
-
-        if i < 4:
-            dut._log.info(f"Test {i}: {a_bf16:.3f} * {b_bf16:.3f} = {got:.3f} (exp {expected:.3f}), rel_err={rel_error:.2e}")
-
-        threshold = 2e-2
-        assert rel_error < threshold, f"Test {i} failed: {a_bf16} * {b_bf16} = {got}, expected {expected}, rel_error={rel_error}"
+    dut._log.info(f"random BF16x2 mult: checked {n_checked} lane-results")
+    assert n_checked > 0
