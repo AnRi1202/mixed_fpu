@@ -30,8 +30,9 @@ module FpAllShared(
     logic [7:0] add_expX_h,add_expX_l;
     logic signX_h, signY_h, EffSub_h;
     logic signX_l, signY_l, EffSub_l;
-    logic [23:0] mantissaY;
-    logic [7:0] mantissaY_h, mantissaY_l;
+    logic [23:0] significandY;
+    logic [7:0] significandY_h, significandY_l;
+    logic [3:0] significandY3, significandY2, significandY1, significandY0;
     logic shiftedOut_h, shiftedOut_l;
     logic shiftedOut_2, shiftedOut_1, shiftedOut_0;  // FP8x4 lanes (shiftedOut_h = lane3)
     logic [4:0] shiftVal_h_fp32;
@@ -505,20 +506,27 @@ module FpAllShared(
     end
 
     /* Sign, Exponent, Fraction Decomposition */
-    assign signX_h = newX.fp32.sign;
-    assign signY_h = newY.fp32.sign;
-    assign signX_l = newX.bf16x2.lo[15];
-    assign signY_l = newY.bf16x2.lo[15];
+    always_comb begin
+        signX_h = newX.fp32.sign;
+        signY_h = newY.fp32.sign;
+        signX_l = newX.bf16x2.lo[15];
+        signY_l = newY.bf16x2.lo[15];
 
-    assign add_expX_h = newX.fp32.exp; // == newX.bf16x2.hi[14:8];
-    assign add_expX_l = newX.bf16x2.lo[14:7];
+        add_expX_h = newX.fp32.exp; // == newX.bf16x2.hi[14:8];
+        add_expX_l = newX.bf16x2.lo[14:7];
 
-    assign EffSub_h = signX_h ^ signY_h;
-    assign EffSub_l = signX_l ^ signY_l;
+        EffSub_h = signX_h ^ signY_h;
+        EffSub_l = signX_l ^ signY_l;
 
 
-    assign mantissaY_h = {1'b1, newY.bf16x2.hi[6:0]};
-    assign mantissaY_l = {1'b1, newY.bf16x2.lo[6:0]};
+        significandY_h = {1'b1, newY.bf16x2.hi[6:0]};
+        significandY_l = {1'b1, newY.bf16x2.lo[6:0]};
+
+        significandY3  = {1'b1, newY.fp8x4.lane3[2:0]};
+        significandY2  = {1'b1, newY.fp8x4.lane2[2:0]};
+        significandY1  = {1'b1, newY.fp8x4.lane1[2:0]};
+        significandY0  = {1'b1, newY.fp8x4.lane0[2:0]};
+    end
 
     always_comb begin: shift
     // FMT_FP32 shift amount (cap at 26)
@@ -542,20 +550,29 @@ module FpAllShared(
 
 
     always_comb begin
-    if (fmt == FMT_FP32) begin
-        shiftVal = {7'b0, shiftVal_h_fp32};
-        mantissaY    = {1'b1, newY[22:0]};
-    end else begin
-        shiftVal = {4'b0, shiftVal_h_fp16, shiftVal_l_fp16};
-        mantissaY    = {mantissaY_h, 8'b0, mantissaY_l};
-    end
+        case (fmt)
+        FMT_FP32: begin
+            shiftVal     = {7'b0, shiftVal_h_fp32};
+            significandY   = {1'b1, newY[22:0]};
+        end
+        FMT_BF16: begin
+            shiftVal     = {4'b0, shiftVal_h_fp16, shiftVal_l_fp16};
+            significandY   = {significandY_h, 8'b0, significandY_l};
+        end
+        FMT_FP8: begin
+            shiftVal     = {shiftVal_3_fp8,shiftVal_2_fp8,shiftVal_1_fp8,shiftVal_0_fp8};
+            significandY = {significandY3, 2'b00, 1'b0, significandY2, 2'b00, significandY1, 2'b00, 1'b0, significandY0};
+            //               [23:20]        [19:18] [17] [16:13]       [12:11] [10:7]        [6:5]  [4]  [3:0]
+        end
+        default: ;
+        endcase
     end
 
     logic [3:0] barrel_sticky;
     BarrelShifter right_shifter_component (
         .fmt(fmt),
         .shiftAmount(shiftVal),
-        .operandX(mantissaY),
+        .operandX(significandY),
         .result(shiftedMantissaY),
         .sticky(barrel_sticky)
     );
@@ -568,28 +585,30 @@ module FpAllShared(
     // [26:16] Lane High: {padding(2), frac(7), guard, rnd}
     // [15:11] Gap/Zero:  {00000}
     // [10: 0] Lane Low:  {padding(2), frac(7), guard, rnd}
-    assign mantissaYpad = {1'b0, shiftedMantissaY}; // align to 27b adder input (MSB pad)
-    assign EffSub_Vector = (fmt == FMT_FP32) ? {27{EffSub_h}} : { {11{EffSub_h}}, 5'd0, {11{EffSub_l}} };
-    assign mantissaYpadXorOp = mantissaYpad ^ EffSub_Vector;
+    always_comb begin
+        mantissaYpad = {1'b0, shiftedMantissaY}; // align to 27b adder input (MSB pad)
+        EffSub_Vector = (fmt == FMT_FP32) ? {27{EffSub_h}} : { {11{EffSub_h}}, 5'd0, {11{EffSub_l}} };
+        mantissaYpadXorOp = mantissaYpad ^ EffSub_Vector;
 
-    assign mantissaXpad =
+        mantissaXpad =
         (fmt ==FMT_FP32) ? {2'b01, newX[22:0], 2'b00}
             : {{2'b01,newX.bf16x2.hi[6:0],2'b0}, 3'b0, 2'b0 , {2'b01, newX.bf16x2.lo[6:0],2'b0}};
             // same bit layout as mantissaYpad
 
-    assign cInSigAdd_h = EffSub_h & (~add_sticky_h);
+        cInSigAdd_h = EffSub_h & (~add_sticky_h);
     // if we subtract and the sticky was one, some of the negated sticky bits would have absorbed this carry
-    assign cInSigAdd_l = (fmt ==FMT_FP32) ? EffSub_h & (~add_sticky_l):  EffSub_l & (~add_sticky_l);
+        cInSigAdd_l = (fmt ==FMT_FP32) ? EffSub_h & (~add_sticky_l):  EffSub_l & (~add_sticky_l);
 
 
     // Connect to Shared IntAdder_27 (TODO: not conneced now. separated from other op)
-    assign add_fracAdder_X = mantissaXpad;       // Connect padded operandX fraction
-    assign add_fracAdder_Y = mantissaYpadXorOp;  // Connect prepared operandY fraction
+        add_fracAdder_X = mantissaXpad;       // Connect padded operandX fraction
+        add_fracAdder_Y = mantissaYpadXorOp;  // Connect prepared operandY fraction
 
     // Vectorize Carry-in for Shared Adder
-    assign cin_vec =
+        cin_vec =
     (fmt == FMT_BF16) ? ((27'(cInSigAdd_l)) | (27'(cInSigAdd_h) << 16))
                 :  (27'(cInSigAdd_l));
+    end
 
     /* Execute Significand Addition/Subtraction */
     assign fracAddResult = add_fracAdder_X + add_fracAdder_Y + cin_vec;
