@@ -61,6 +61,12 @@ module FpAllShared(
     logic [30:0] add_RoundedExpFrac;
     logic [31:0] add_R_fp32;
     logic [31:0] add_R_fp16;
+    logic [31:0] add_R_fp8;
+    // FP8x4 per-lane exponent update / rounding
+    logic [3:0] add_expX_f8 [4];
+    logic [4:0] updatedExp_f8 [4];
+    logic stk_f8 [4], rnd_f8 [4], lsb_f8 [4];
+    logic add_round_f8 [4];
 
     // FPMul signals
     logic sign_h;
@@ -534,7 +540,7 @@ module FpAllShared(
 
     always_comb begin: shift
     // FMT_FP32 shift amount (cap at 26)
-        shiftedOut_h    = (fmt == FMT_FP8) ? (expDiff_3 > 4'd4) : (|expDiff_h[7:5]); // expDiff_h > 31
+        shiftedOut_h    = (fmt == FMT_FP8) ? (expDiff_3 > 4'd5) : (|expDiff_h[7:5]); // expDiff_h > 31
         shiftVal_h_fp32 = shiftedOut_h ? 5'd26 : expDiff_h[4:0];
 
     // FMT_BF16 shift amount (cap at 10)
@@ -542,14 +548,16 @@ module FpAllShared(
         shiftVal_h_fp16 = (shiftedOut_h |expDiff_h[4]) ? 4'd10 : expDiff_h[3:0]; //expDiff_h > 16 (area -4)
         shiftVal_l_fp16 = shiftedOut_l ? 4'd10 : expDiff_l[3:0];
 
-    // FMT_FP8 shift amount (cap at 5; diff > 4 => fully shifted out)
-        shiftedOut_2 = (expDiff_2 > 4'd4);
-        shiftedOut_1 = (expDiff_1 > 4'd4);
-        shiftedOut_0 = (expDiff_0 > 4'd4);
-        shiftVal_3_fp8 = shiftedOut_h ? 3'd5 : expDiff_3[2:0];
-        shiftVal_2_fp8 = shiftedOut_2 ? 3'd5 : expDiff_2[2:0];
-        shiftVal_1_fp8 = shiftedOut_1 ? 3'd5 : expDiff_1[2:0];
-        shiftVal_0_fp8 = shiftedOut_0 ? 3'd5 : expDiff_0[2:0];
+    // FMT_FP8 shift amount: 6-bit lane content (implicit @bit5), so a shift of 5
+    // still keeps the implicit bit (@bit0); only diff >= 6 fully flushes it into
+    // sticky. Cap at 6 for diff > 5.
+        shiftedOut_2 = (expDiff_2 > 4'd5);
+        shiftedOut_1 = (expDiff_1 > 4'd5);
+        shiftedOut_0 = (expDiff_0 > 4'd5);
+        shiftVal_3_fp8 = shiftedOut_h ? 3'd6 : expDiff_3[2:0];
+        shiftVal_2_fp8 = shiftedOut_2 ? 3'd6 : expDiff_2[2:0];
+        shiftVal_1_fp8 = shiftedOut_1 ? 3'd6 : expDiff_1[2:0];
+        shiftVal_0_fp8 = shiftedOut_0 ? 3'd6 : expDiff_0[2:0];
     end
 
 
@@ -665,11 +673,11 @@ module FpAllShared(
                 if (EffSub[1]) fracSticky[13] = 1'b0;
                 if (EffSub[2]) fracSticky[20] = 1'b0;
                 if (EffSub[3]) fracSticky[27] = 1'b0;
-                // fold each lane's shifted-out sticky into its round/sticky LSB
-                fracSticky[0]  = fracSticky[0]  | add_sticky[0];
-                fracSticky[7]  = fracSticky[7]  | add_sticky[1];
-                fracSticky[14] = fracSticky[14] | add_sticky[2];
-                fracSticky[21] = fracSticky[21] | add_sticky[3];
+                // NOTE: the barrel-shifter sticky is NOT folded into the lane here.
+                // Normalization left-shifts the lane (by up to ~2 for FP8), which
+                // would carry a folded sticky into the guard position and corrupt
+                // rounding. Instead it is OR'd into the post-normalization sticky
+                // term (stk_f8) below.
             end
             default : begin
                 fracSticky = {fracAddResult, add_sticky[0]};
@@ -700,6 +708,16 @@ module FpAllShared(
     assign updatedExp_h = extendedExpInc_h - normShift_h;
     assign updatedExp_l = (fmt == FMT_FP32) ? 8'd0 : (extendedExpInc_l - normShift_l);
 
+    // FP8x4 per-lane exponent update: updatedExp = expX + 1 - leadingZeros
+    always_comb begin
+        add_expX_f8[3] = newX.fp8x4.lane3[6:3];
+        add_expX_f8[2] = newX.fp8x4.lane2[6:3];
+        add_expX_f8[1] = newX.fp8x4.lane1[6:3];
+        add_expX_f8[0] = newX.fp8x4.lane0[6:3];
+        for (int i = 0; i < 4; i++)
+            updatedExp_f8[i] = ({1'b0, add_expX_f8[i]} + 5'd1) - nZerosNew[i];
+    end
+
 
 
     /* --- rounding --- */
@@ -707,13 +725,20 @@ module FpAllShared(
     assign shiftedFrac_l = shiftedFrac[13:0];
 
     // FMT_FP32: exponent uses high lane, rounding uses low lane
+    // FMT_FP8 : 4 lanes of {exp(4),frac(3)} at [6:0]/[14:8]/[22:16]/[30:24], gaps [7]/[15]/[23]
     always_comb begin
-        add_expFrac = '0;
-        if (fmt ==FMT_FP32) begin
-            add_expFrac = {updatedExp_h, shiftedFrac_h[12:0], shiftedFrac_l[13:4]}; //[26:3] 暗黙は消えてる
-        end else begin
-            add_expFrac = {updatedExp_h, shiftedFrac_h[12:6],1'b0, updatedExp_l, shiftedFrac_l[10:4]}; //31bit
-        end
+        case (fmt)
+        FMT_FP32: add_expFrac = {updatedExp_h, shiftedFrac_h[12:0], shiftedFrac_l[13:4]}; //[26:3] 暗黙は消えてる
+        FMT_BF16: add_expFrac = {updatedExp_h, shiftedFrac_h[12:6],1'b0, updatedExp_l, shiftedFrac_l[10:4]}; //31bit
+        FMT_FP8 : add_expFrac = { updatedExp_f8[3][3:0], shiftedFrac[26:24],
+                                  1'b0,
+                                  updatedExp_f8[2][3:0], shiftedFrac[19:17],
+                                  1'b0,
+                                  updatedExp_f8[1][3:0], shiftedFrac[12:10],
+                                  1'b0,
+                                  updatedExp_f8[0][3:0], shiftedFrac[5:3] };
+        default : add_expFrac = '0;
+        endcase
     end
     assign stk_h = |shiftedFrac_h[4:2];
     assign rnd_h = shiftedFrac_h[5];
@@ -726,10 +751,26 @@ module FpAllShared(
     assign add_round_h = rnd_h & (stk_h | lsb_h);
     assign add_round_l = rnd_l & (stk_l | lsb_l);
 
+    // FP8x4 per-lane round bits (guard/round/sticky just below the kept 3-bit frac).
+    // The barrel-shifter sticky (bits Y lost to the right shift) always sits below
+    // every datapath bit, so it is OR'd straight into the sticky term here.
+    always_comb begin
+        lsb_f8[0] = shiftedFrac[3];  rnd_f8[0] = shiftedFrac[2];  stk_f8[0] = |shiftedFrac[1:0]  | add_sticky[0];
+        lsb_f8[1] = shiftedFrac[10]; rnd_f8[1] = shiftedFrac[9];  stk_f8[1] = |shiftedFrac[8:7]  | add_sticky[1];
+        lsb_f8[2] = shiftedFrac[17]; rnd_f8[2] = shiftedFrac[16]; stk_f8[2] = |shiftedFrac[15:14] | add_sticky[2];
+        lsb_f8[3] = shiftedFrac[24]; rnd_f8[3] = shiftedFrac[23]; stk_f8[3] = |shiftedFrac[22:21] | add_sticky[3];
+        for (int i = 0; i < 4; i++)
+            add_round_f8[i] = rnd_f8[i] & (stk_f8[i] | lsb_f8[i]);
+    end
+
     // Add: connect to Shared Rounding Adder
     assign round_vec =
-        (fmt == FMT_BF16) ? ((31'(add_round_l)) | (31'(add_round_h) << 16))
-                :  (31'(add_round_l));
+        (fmt == FMT_BF16) ? ((31'(add_round_l)) | (31'(add_round_h) << 16)) :
+        (fmt == FMT_FP8)  ? ( 31'(add_round_f8[0])
+                            | (31'(add_round_f8[1]) << 8)
+                            | (31'(add_round_f8[2]) << 16)
+                            | (31'(add_round_f8[3]) << 24))
+                          :  (31'(add_round_l));
     assign add_ra_X = add_expFrac;
     assign add_ra_Y = round_vec;
     assign add_RoundedExpFrac = ra_R[30:0];  // from Shared RA when opcode==FOP_ADD
@@ -747,7 +788,17 @@ module FpAllShared(
         add_RoundedExpFrac[14:0]   // exp+frac low lane
     };
 
-    assign add_R = (fmt == FMT_FP32) ? add_R_fp32 : add_R_fp16;
+    // FP8x4: 4 lanes of {sign, exp(4), frac(3)} = 8b each
+    assign add_R_fp8 = {
+        signX[3], add_RoundedExpFrac[30:24],
+        signX[2], add_RoundedExpFrac[22:16],
+        signX[1], add_RoundedExpFrac[14:8],
+        signX[0], add_RoundedExpFrac[6:0]
+    };
+
+    assign add_R = (fmt == FMT_FP32) ? add_R_fp32 :
+                   (fmt == FMT_BF16) ? add_R_fp16 :
+                                       add_R_fp8;
 
 
 

@@ -2,67 +2,89 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, Timer
 import math
+import random
+
+# ============================================================================
+# E4M3 FP8 helpers
+#   format : sign(1) | exp(4, bias=7) | mantissa(3)
+#   normal : exp in [1,15]   value = (-1)^s * 2^(exp-7) * (1 + m/8)
+#   subnorm: exp == 0        value = (-1)^s * 2^(-6)    * (m/8)
+#   (specials such as exp==15&m==7 (NaN) are avoided by the testbench)
+# ============================================================================
+
+FP8_MIN_NORMAL = 2.0 ** -6        # smallest positive normal (0.015625)
+FP8_MAX_NORMAL = (1.0 + 6.0 / 8.0) * (2.0 ** 8)  # 448.0 (exp=15,m=6)
 
 
-def float_to_fp8_e4m3(f):
-    """Convert a Python float to E4M3 FP8 format.
-    E4M3: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits.
-    Mantissa is truncated toward zero to match the hardware datapath.
-    Subnormals/overflow are flushed/saturated (kept out of the test range).
-    """
-    if f == 0.0 or math.isnan(f):
+def fp8_to_float(bits):
+    bits &= 0xFF
+    s = (bits >> 7) & 1
+    e = (bits >> 3) & 0xF
+    m = bits & 0x7
+    if e == 0:
+        val = (m / 8.0) * (2.0 ** -6)
+    else:
+        val = (1.0 + m / 8.0) * (2.0 ** (e - 7))
+    return -val if s else val
+
+
+def _round_half_even(x):
+    f = math.floor(x)
+    diff = x - f
+    if diff < 0.5:
+        return f
+    if diff > 0.5:
+        return f + 1
+    return f if (f % 2 == 0) else f + 1  # tie -> nearest even
+
+
+def float_to_fp8_rne(x):
+    """Round a real value to E4M3 (round-to-nearest-even).
+    Returns the 8-bit pattern, or None if the value is not representable
+    as a finite E4M3 normal/subnormal (overflow)."""
+    if x == 0.0:
         return 0
-    sign = 1 if f < 0 else 0
-    af = abs(f)
-    e = math.floor(math.log2(af))
-    exp_field = e + 7
-    if exp_field < 1:
-        # underflow -> flush to (signed) zero
-        return sign << 7
-    if exp_field > 15:
-        # overflow -> saturate to largest magnitude
-        return (sign << 7) | (15 << 3) | 0x7
-    mant = af / (2.0 ** e) - 1.0  # fractional part in [0, 1)
-    mant_bits = int(mant * 8.0)   # truncate to 3 bits
-    if mant_bits > 7:
-        mant_bits = 7
-    return (sign << 7) | (exp_field << 3) | mant_bits
+    s = 1 if x < 0 else 0
+    a = abs(x)
+    e = math.floor(math.log2(a))
+    if e >= -6:  # normal candidate
+        m8 = (a / (2.0 ** e) - 1.0) * 8.0
+        mi = _round_half_even(m8)
+        if mi == 8:
+            mi = 0
+            e += 1
+        E = e + 7
+        if E >= 15:
+            return None  # overflow (no Inf in E4M3; max finite is 448)
+        if E < 1:
+            return s << 7  # underflow to zero
+        return (s << 7) | (E << 3) | mi
+    else:  # subnormal
+        mi = _round_half_even(a / (2.0 ** -9))
+        if mi <= 0:
+            return s << 7
+        if mi >= 8:
+            return (s << 7) | (1 << 3)  # rounds up to smallest normal
+        return (s << 7) | mi
 
 
-def fp8_e4m3_to_float(h):
-    """Convert an E4M3 FP8 byte to a Python float."""
-    h &= 0xFF
-    sign = -1.0 if (h >> 7) & 1 else 1.0
-    exp_field = (h >> 3) & 0xF
-    mant = h & 0x7
-    if exp_field == 0:
-        # subnormal: value = sign * 2^(1-7) * (mant/8)
-        return sign * (2.0 ** (1 - 7)) * (mant / 8.0)
-    return sign * (2.0 ** (exp_field - 7)) * (1.0 + mant / 8.0)
+def pack(lanes):
+    """lanes[0..3] -> 32-bit word (lane3 is the MSB byte)."""
+    return ((lanes[3] & 0xFF) << 24) | ((lanes[2] & 0xFF) << 16) | \
+           ((lanes[1] & 0xFF) << 8) | (lanes[0] & 0xFF)
 
 
-def fp8_ulp(x):
-    """Gap between adjacent E4M3 values around magnitude |x|."""
-    ax = abs(x)
-    if ax == 0.0:
-        return 2.0 ** (1 - 7 - 3)  # smallest subnormal step
-    e = math.floor(math.log2(ax))
-    exp_field = e + 7
-    if exp_field < 1:
-        exp_field = 1
-    if exp_field > 15:
-        exp_field = 15
-    return 2.0 ** (exp_field - 7 - 3)
+def unpack(word, i):
+    return (word >> (8 * i)) & 0xFF
 
 
-@cocotb.test()
-async def test_fp8_adder_pipeline(dut):
-    """Test the FP8 (E4M3) adder with addition and subtraction cases"""
+def fp8_add_ref(a_bits, b_bits):
+    """Bit-accurate reference: exact sum of the two FP8 values, RNE back to FP8."""
+    return float_to_fp8_rne(fp8_to_float(a_bits) + fp8_to_float(b_bits))
 
-    # 1. Start the clock (100MHz / 10ns period)
+
+async def _reset(dut):
     cocotb.start_soon(Clock(dut.i_clk, 10, unit="ns").start())
-
-    # 2. Reset the DUT
     dut.i_rst_n.value = 0
     dut.i_operand_a.value = 0
     dut.i_operand_b.value = 0
@@ -70,105 +92,94 @@ async def test_fp8_adder_pipeline(dut):
     dut.i_rst_n.value = 1
     await RisingEdge(dut.i_clk)
 
-    # Warm-up: flush the pipeline after reset
-    dut.i_operand_a.value = float_to_fp8_e4m3(1.0)
-    dut.i_operand_b.value = float_to_fp8_e4m3(1.0)
-    for i in range(5):
-        await RisingEdge(dut.i_clk)
 
-    # All cases use exactly E4M3-representable values and results.
+@cocotb.test()
+async def test_fp8_directed(dut):
+    """Directed FP8x4 cases, one independent (a,b) pair per lane."""
+    await _reset(dut)
+
+    # (a, b) per lane -> tests addition, subtraction and sign handling at once.
     cases = [
-        (1.5, 2.5),    # 4.0
-        (5.0, -2.0),   # 3.0
-        (-3.5, 1.5),   # -2.0
-        (-2.0, -3.0),  # -5.0
-        (0.5, 0.25),   # 0.75
+        (1.5, 2.5),    # lane0 : 4.0
+        (5.0, -2.0),   # lane1 : 3.0
+        (-3.5, 1.5),   # lane2 : -2.0
+        (-2.0, -3.0),  # lane3 : -5.0
     ]
 
-    for idx, (val_a, val_b) in enumerate(cases, start=1):
-        expected = val_a + val_b
+    a_lanes = [float_to_fp8_rne(a) for (a, _) in cases]
+    b_lanes = [float_to_fp8_rne(b) for (_, b) in cases]
 
-        dut.i_operand_a.value = float_to_fp8_e4m3(val_a)
-        dut.i_operand_b.value = float_to_fp8_e4m3(val_b)
+    dut.i_operand_a.value = pack(a_lanes)
+    dut.i_operand_b.value = pack(b_lanes)
+    for _ in range(3):
+        await RisingEdge(dut.i_clk)
 
+    res = dut.o_sum.value.to_unsigned()
+    for i, (a, b) in enumerate(cases):
+        exp_bits = fp8_add_ref(a_lanes[i], b_lanes[i])
+        got_bits = unpack(res, i)
+        got = fp8_to_float(got_bits)
+        exp = fp8_to_float(exp_bits)
         dut._log.info(
-            f"Input hex: a=0x{float_to_fp8_e4m3(val_a):02X}, "
-            f"b=0x{float_to_fp8_e4m3(val_b):02X}"
-        )
-
-        # Account for the pipeline stages
-        for _ in range(5):
-            await RisingEdge(dut.i_clk)
-
-        result_hex = dut.o_sum.value.to_unsigned()
-        result_float = fp8_e4m3_to_float(result_hex)
-
-        tol = fp8_ulp(expected) + 1e-9
-        error = abs(result_float - expected)
-        dut._log.info(
-            f"Test {idx}: {val_a} + {val_b} = {result_float} "
-            f"(expected {expected}), error={error:.3e}, hex=0x{result_hex:02X}"
-        )
-        assert error <= tol, (
-            f"Test {idx} failed: {val_a} + {val_b} = {result_float}, "
-            f"expected {expected}, error={error}, tol={tol}"
-        )
+            f"lane{i}: {fp8_to_float(a_lanes[i])} + {fp8_to_float(b_lanes[i])} "
+            f"= {got} (expected {exp}), got=0x{got_bits:02X} exp=0x{exp_bits:02X}")
+        assert got_bits == exp_bits, \
+            f"lane{i} failed: {a}+{b} -> 0x{got_bits:02X} ({got}), expected 0x{exp_bits:02X} ({exp})"
 
 
 @cocotb.test()
-async def test_fp8_random_floats(dut):
-    """Feed random FP8 (E4M3) floats and check results after pipeline latency"""
-    import random
+async def test_fp8_random(dut):
+    """Random FP8x4 addition; bit-accurate vs RNE reference."""
+    await _reset(dut)
+    random.seed(0xF8)
 
-    cocotb.start_soon(Clock(dut.i_clk, 10, unit="ns").start())
+    def rand_normal_bits():
+        # exp in [4,11] keeps inputs as clean normals; mantissa free.
+        s = random.randint(0, 1)
+        e = random.randint(4, 11)
+        m = random.randint(0, 7)
+        return (s << 7) | (e << 3) | m
 
-    dut.i_rst_n.value = 0
-    dut.i_operand_a.value = 0
-    dut.i_operand_b.value = 0
-    await RisingEdge(dut.i_clk)
-    await RisingEdge(dut.i_clk)
-    dut.i_rst_n.value = 1
-    await RisingEdge(dut.i_clk)
+    n_checked = 0
+    for it in range(300):
+        a_lanes = [0, 0, 0, 0]
+        b_lanes = [0, 0, 0, 0]
+        exp_lanes = [None, None, None, None]
 
-    # E4M3 normal range is narrow; keep magnitudes well inside it.
-    for i in range(240):
-        a = random.uniform(-15.0, 15.0)
-        b = random.uniform(-15.0, 15.0)
+        for i in range(4):
+            # regenerate until the lane lands on a checkable (finite normal) result
+            for _ in range(20):
+                ab = rand_normal_bits()
+                bb = rand_normal_bits()
+                ref = fp8_add_ref(ab, bb)
+                if ref is None:
+                    continue
+                s = fp8_to_float(ab) + fp8_to_float(bb)
+                if s == 0.0 or abs(s) < FP8_MIN_NORMAL:
+                    continue  # skip zero / subnormal results (no special-case HW)
+                a_lanes[i], b_lanes[i], exp_lanes[i] = ab, bb, ref
+                break
 
-        a_hex = float_to_fp8_e4m3(a)
-        b_hex = float_to_fp8_e4m3(b)
-        a_fp8 = fp8_e4m3_to_float(a_hex)
-        b_fp8 = fp8_e4m3_to_float(b_hex)
+        dut.i_operand_a.value = pack(a_lanes)
+        dut.i_operand_b.value = pack(b_lanes)
+        await RisingEdge(dut.i_clk)
+        await RisingEdge(dut.i_clk)
 
-        # Ideal real sum of the actual FP8 operands.
-        expected = a_fp8 + b_fp8
+        res = dut.o_sum.value.to_unsigned()
+        for i in range(4):
+            if exp_lanes[i] is None:
+                continue
+            got_bits = unpack(res, i)
+            if got_bits != exp_lanes[i] and n_checked < 40:
+                dut._log.warning(
+                    f"it{it} lane{i}: {fp8_to_float(a_lanes[i])} + {fp8_to_float(b_lanes[i])} "
+                    f"-> 0x{got_bits:02X} ({fp8_to_float(got_bits)}), "
+                    f"expected 0x{exp_lanes[i]:02X} ({fp8_to_float(exp_lanes[i])})")
+            assert got_bits == exp_lanes[i], (
+                f"it{it} lane{i} failed: 0x{a_lanes[i]:02X}+0x{b_lanes[i]:02X} -> "
+                f"0x{got_bits:02X} ({fp8_to_float(got_bits)}), "
+                f"expected 0x{exp_lanes[i]:02X} ({fp8_to_float(exp_lanes[i])})")
+            n_checked += 1
 
-        dut.i_operand_a.value = a_hex
-        dut.i_operand_b.value = b_hex
-
-        for _ in range(5):
-            await RisingEdge(dut.i_clk)
-
-        result_hex = dut.o_sum.value.to_unsigned()
-        got = fp8_e4m3_to_float(result_hex)
-        error = abs(got - expected)
-
-        # Allow up to 1 ULP of rounding error around the ideal sum.
-        tol = fp8_ulp(expected) + 1e-9
-
-        if i < 4:
-            dut._log.info(
-                f"Test {i}: {a_fp8:.4f} + {b_fp8:.4f} = {got:.4f} "
-                f"(exp {expected:.4f}), hex=0x{result_hex:02X}, err={error:.3e}"
-            )
-
-        if error > tol:
-            dut._log.warning(
-                f"Large error at test {i}: {a_fp8:.4f} + {b_fp8:.4f} = {got:.4f} "
-                f"(expected {expected:.4f}), error={error:.3e}, tol={tol:.3e}"
-            )
-
-        assert error <= tol, (
-            f"Test {i} failed: {a_fp8} + {b_fp8} = {got}, expected {expected}, "
-            f"error={error}, tol={tol}"
-        )
+    dut._log.info(f"random FP8x4: checked {n_checked} lane-results")
+    assert n_checked > 0

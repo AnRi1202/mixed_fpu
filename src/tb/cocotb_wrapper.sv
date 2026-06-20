@@ -154,35 +154,32 @@ module bf16_mult_wrapper (
 endmodule
 
 // ============================================================================
-// FP8x4 add wrapper (8-bit lane interface, E4M3)
-// Drives lane0 with the test operand, ties the remaining lanes to 0 and
-// reads back lane0, mirroring the single-lane BF16 wrapper above.
+// FP8x4 add wrapper (32-bit packed interface, E4M3)
+// Full 4-lane interface: lane3=[31:24], lane2=[23:16], lane1=[15:8], lane0=[7:0].
 // ============================================================================
 module fp8_add_wrapper (
-  input   logic                 i_clk,
-  input   logic                 i_rst_n,
-  input   logic [FP8_WIDTH-1:0] i_operand_a,
-  input   logic [FP8_WIDTH-1:0] i_operand_b,
-  output  logic [FP8_WIDTH-1:0] o_sum
+  input   logic                  i_clk,
+  input   logic                  i_rst_n,
+  input   logic [FP32_WIDTH-1:0] i_operand_a,
+  input   logic [FP32_WIDTH-1:0] i_operand_b,
+  output  logic [FP32_WIDTH-1:0] o_sum
 );
-  logic [FP32_WIDTH-1:0] tmpResult;
 `ifdef FOUROPS
   // 4Ops is FP32-only; FP8 is unsupported.
-  assign tmpResult = '0;
+  assign o_sum = '0;
 `elsif MIXED_ADDMULT
   // mixed_addmult supports FP32/BF16 only; FP8 is unsupported.
-  assign tmpResult = '0;
+  assign o_sum = '0;
 `else // SIXOPS
   FpAllShared u_dut (
     .clk      (i_clk),
     .opcode   (FOP_ADD),
     .fmt      (FMT_FP8),
-    .operandX ({24'b0, i_operand_a}),
-    .operandY ({24'b0, i_operand_b}),
-    .result   (tmpResult)
+    .operandX (i_operand_a),
+    .operandY (i_operand_b),
+    .result   (o_sum)
   );
 `endif
-  assign o_sum = tmpResult[7:0];
 endmodule
 
 // ============================================================================
