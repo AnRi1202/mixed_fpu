@@ -37,7 +37,7 @@ module FpAllShared(
     logic [4:0] shiftVal_h_fp32;
     logic [3:0] shiftVal_h_fp16, shiftVal_l_fp16;
     logic [2:0] shiftVal_3_fp8, shiftVal_2_fp8, shiftVal_1_fp8, shiftVal_0_fp8;
-    logic [7:0] shiftVal;
+    logic [11:0] shiftVal;
     logic [25:0] shiftedMantissaY;
     logic add_sticky_h, add_sticky_l;
     logic [26:0] mantissaYpad, EffSub_Vector, mantissaYpadXorOp, mantissaXpad;
@@ -450,20 +450,34 @@ module FpAllShared(
         .swap(swap)
     );
 
-    // assign swap = swaps[1]; // Currently forcing FMT_FP32 behavior for swap as the rest of the logic isn't updated yet.
     // input swap so that |operandX|>|operandY|
+    //
+    // AbsComparator's swap[i] (= ~c[i]) is the magnitude-compare result of the
+    // *region* whose MSB byte is lane i. Because carries propagate across
+    // non-cut boundaries, only the top byte of each region carries the valid
+    // decision; the other bytes in the same region must reuse that same bit:
+    //   FMT_FP32 : one 32-bit region {L3,L2,L1,L0}        -> all use swap[3]
+    //   FMT_BF16 : two 16-bit regions {L3,L2},{L1,L0}     -> hi uses swap[3], lo uses swap[1]
+    //   FMT_FP8  : four 8-bit regions {L3},{L2},{L1},{L0} -> each uses its own swap[i]
+    logic swap_sel3, swap_sel2, swap_sel1, swap_sel0;
     always_comb begin : swap_sel
-        newX.fp8x4.lane3 = (swap[3] == 1'b0) ? x.fp8x4.lane3 : y.fp8x4.lane3;
-        newY.fp8x4.lane3 = (swap[3] == 1'b0) ? y.fp8x4.lane3 : x.fp8x4.lane3;
+        swap_sel3 = swap[3];
+        swap_sel2 = (fmt == FMT_FP8)  ? swap[2] : swap[3];
+        swap_sel1 = (fmt == FMT_FP32) ? swap[3] : swap[1];
+        swap_sel0 = (fmt == FMT_FP32) ? swap[3] :
+                    (fmt == FMT_BF16) ? swap[1] : swap[0];
 
-        newX.fp8x4.lane2 = (swap[2] == 1'b0) ? x.fp8x4.lane2 : y.fp8x4.lane2;
-        newY.fp8x4.lane2 = (swap[2] == 1'b0) ? y.fp8x4.lane2 : x.fp8x4.lane2;
+        newX.fp8x4.lane3 = (swap_sel3 == 1'b0) ? x.fp8x4.lane3 : y.fp8x4.lane3;
+        newY.fp8x4.lane3 = (swap_sel3 == 1'b0) ? y.fp8x4.lane3 : x.fp8x4.lane3;
 
-        newX.fp8x4.lane1 = (swap[1] == 1'b0) ? x.fp8x4.lane1 : y.fp8x4.lane1;
-        newY.fp8x4.lane1 = (swap[1] == 1'b0) ? y.fp8x4.lane1 : x.fp8x4.lane1;
+        newX.fp8x4.lane2 = (swap_sel2 == 1'b0) ? x.fp8x4.lane2 : y.fp8x4.lane2;
+        newY.fp8x4.lane2 = (swap_sel2 == 1'b0) ? y.fp8x4.lane2 : x.fp8x4.lane2;
 
-        newX.fp8x4.lane0 = (swap[0] == 1'b0) ? x.fp8x4.lane0 : y.fp8x4.lane0;
-        newY.fp8x4.lane0 = (swap[0] == 1'b0) ? y.fp8x4.lane0 : x.fp8x4.lane0;
+        newX.fp8x4.lane1 = (swap_sel1 == 1'b0) ? x.fp8x4.lane1 : y.fp8x4.lane1;
+        newY.fp8x4.lane1 = (swap_sel1 == 1'b0) ? y.fp8x4.lane1 : x.fp8x4.lane1;
+
+        newX.fp8x4.lane0 = (swap_sel0 == 1'b0) ? x.fp8x4.lane0 : y.fp8x4.lane0;
+        newY.fp8x4.lane0 = (swap_sel0 == 1'b0) ? y.fp8x4.lane0 : x.fp8x4.lane0;
 
     end
 
@@ -529,22 +543,24 @@ module FpAllShared(
 
     always_comb begin
     if (fmt == FMT_FP32) begin
-        shiftVal = {3'b0, shiftVal_h_fp32};
+        shiftVal = {7'b0, shiftVal_h_fp32};
         mantissaY    = {1'b1, newY[22:0]};
     end else begin
-        shiftVal = {shiftVal_h_fp16, shiftVal_l_fp16};
+        shiftVal = {4'b0, shiftVal_h_fp16, shiftVal_l_fp16};
         mantissaY    = {mantissaY_h, 8'b0, mantissaY_l};
     end
     end
 
+    logic [3:0] barrel_sticky;
     BarrelShifter right_shifter_component (
         .fmt(fmt),
         .shiftAmount(shiftVal),
         .operandX(mantissaY),
         .result(shiftedMantissaY),
-        .stickyHi(add_sticky_h),
-        .stickyLo(add_sticky_l)
+        .sticky(barrel_sticky)
     );
+    assign add_sticky_l = barrel_sticky[0]; // FP32 global / BF16 lo
+    assign add_sticky_h = barrel_sticky[2]; // BF16 hi
     /* --- Significand Addition Prep --- */
 
     // ** Bit Layout (27-bit) [mantissaYpad, EffSub_Vector, mantissaXpad] **:
