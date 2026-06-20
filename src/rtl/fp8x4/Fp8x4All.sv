@@ -86,6 +86,19 @@ module FpAllShared(
     logic [30:0] expSigPostRound;
     logic [1:0] excPostNorm, finalExc;
 
+    // FPMul FP8x4 signals (lanes 2 and 0 use dedicated 4x4 mults; lanes 3 and 1
+    // are packed into the shared 25x25 multiplier alongside FP32/BF16)
+    logic [3:0]  mult_sigX2, mult_sigY2, mult_sigX0, mult_sigY0;
+    logic [7:0]  mult_prod2, mult_prod0;
+    logic [3:0]  mult_expX_f8 [4], mult_expY_f8 [4];
+    logic [7:0]  mult_prod_f8 [4];
+    logic        mult_norm_f8 [4];
+    logic [7:0]  mult_prodN_f8 [4];
+    logic [2:0]  mult_frac3_f8 [4];
+    logic        mult_roundup_f8 [4];
+    logic [5:0]  mult_expSum_f8 [4];
+    logic [3:0]  mult_sign_f8;
+
     // FPDiv signals
     logic [23:0] fX, fY;
     logic [9:0] expR0;
@@ -826,15 +839,55 @@ module FpAllShared(
     assign expSum_h = expSumPreSub_h - bias;
     assign expSum_l = expSumPreSub_l - bias;
 
+    // Shared 25x25 multiplier inputs:
+    //   FP32 : full 25b significand
+    //   BF16 : 2 packed 8x8 (hi @ [49:34], lo @ [15:0])
+    //   FP8  : 2 packed 4x4 (lane3 @ [31:24], lane1 @ [7:0]); lanes 2/0 use
+    //          the dedicated mult_prod2 / mult_prod0 below.
     assign sigX =
         (fmt ==FMT_FP32) ? {2'b01, mult_x.fp32.frac}
-            : { {1'b1, mult_x.bf16x2.hi[6:0]}, 9'b0, {1'b1, mult_x.bf16x2.lo[6:0]}};
+      : (fmt ==FMT_BF16) ? { {1'b1, mult_x.bf16x2.hi[6:0]}, 9'b0, {1'b1, mult_x.bf16x2.lo[6:0]}}
+      :                    {9'b0, 1'b1, mult_x.fp8x4.lane3[2:0], 8'b0, 1'b1, mult_x.fp8x4.lane1[2:0]};
 
     assign sigY =
         (fmt ==FMT_FP32) ? {2'b01, mult_y.fp32.frac}
-            : { {1'b1, mult_y.bf16x2.hi[6:0]}, 9'b0, {1'b1, mult_y.bf16x2.lo[6:0]}};
+      : (fmt ==FMT_BF16) ? { {1'b1, mult_y.bf16x2.hi[6:0]}, 9'b0, {1'b1, mult_y.bf16x2.lo[6:0]}}
+      :                    {9'b0, 1'b1, mult_y.fp8x4.lane3[2:0], 8'b0, 1'b1, mult_y.fp8x4.lane1[2:0]};
     always_comb begin
         sigProd = sigX * sigY;
+    end
+
+    // FP8x4 dedicated 4x4 multipliers for lanes 2 and 0
+    assign mult_sigX2 = {1'b1, mult_x.fp8x4.lane2[2:0]};
+    assign mult_sigY2 = {1'b1, mult_y.fp8x4.lane2[2:0]};
+    assign mult_sigX0 = {1'b1, mult_x.fp8x4.lane0[2:0]};
+    assign mult_sigY0 = {1'b1, mult_y.fp8x4.lane0[2:0]};
+    assign mult_prod2 = mult_sigX2 * mult_sigY2;
+    assign mult_prod0 = mult_sigX0 * mult_sigY0;
+
+    // FP8x4 per-lane sign / exponent / normalization / rounding
+    assign mult_sign_f8[3] = operandX[31] ^ operandY[31];
+    assign mult_sign_f8[2] = operandX[23] ^ operandY[23];
+    assign mult_sign_f8[1] = operandX[15] ^ operandY[15];
+    assign mult_sign_f8[0] = operandX[7]  ^ operandY[7];
+    always_comb begin
+        mult_expX_f8[3] = mult_x.fp8x4.lane3[6:3]; mult_expY_f8[3] = mult_y.fp8x4.lane3[6:3];
+        mult_expX_f8[2] = mult_x.fp8x4.lane2[6:3]; mult_expY_f8[2] = mult_y.fp8x4.lane2[6:3];
+        mult_expX_f8[1] = mult_x.fp8x4.lane1[6:3]; mult_expY_f8[1] = mult_y.fp8x4.lane1[6:3];
+        mult_expX_f8[0] = mult_x.fp8x4.lane0[6:3]; mult_expY_f8[0] = mult_y.fp8x4.lane0[6:3];
+
+        mult_prod_f8[0] = mult_prod0;
+        mult_prod_f8[1] = sigProd[7:0];
+        mult_prod_f8[2] = mult_prod2;
+        mult_prod_f8[3] = sigProd[31:24];
+        for (int k = 0; k < 4; k++) begin
+            mult_norm_f8[k]    = mult_prod_f8[k][7];
+            mult_prodN_f8[k]   = mult_norm_f8[k] ? mult_prod_f8[k] : {mult_prod_f8[k][6:0], 1'b0};
+            mult_frac3_f8[k]   = mult_prodN_f8[k][6:4];
+            mult_roundup_f8[k] = mult_prodN_f8[k][3] & (mult_prodN_f8[k][4] | (|mult_prodN_f8[k][2:0]));
+            mult_expSum_f8[k]  = ({2'b0, mult_expX_f8[k]} + {2'b0, mult_expY_f8[k]})
+                               - 6'd7 + {5'b0, mult_norm_f8[k]};
+        end
     end
 
 
@@ -856,15 +909,20 @@ module FpAllShared(
     end
 
     always_comb begin
-        if(fmt == FMT_FP32) begin
-            expSig = {expPostNorm_h, sigProdExt[47:25]};
-        end else begin
-            // Internal layout: High Lane [30:16] | sign_l [15] | Low Lane [14:0]
-            // Lane = Exp(8) + Frac(7). sign_l is used for separation and packed later.
-            expSig = { {expPostNorm_h, sigProdExt[47:41]},
-                       sign_l,
-                       {expPostNorm_l, sigProdExt[15:9]} };
-        end
+        case (fmt)
+        FMT_FP32: expSig = {expPostNorm_h, sigProdExt[47:25]};
+        // Internal layout: High Lane [30:16] | sign_l [15] | Low Lane [14:0]
+        // Lane = Exp(8) + Frac(7). sign_l is used for separation and packed later.
+        FMT_BF16: expSig = { {expPostNorm_h, sigProdExt[47:41]},
+                             sign_l,
+                             {expPostNorm_l, sigProdExt[15:9]} };
+        // FP8x4: per byte {exp4, frac3} with gap bits [23]/[15]/[7] isolating
+        // the rounding carries between lanes.
+        default : expSig = { mult_expSum_f8[3][3:0], mult_frac3_f8[3], 1'b0,
+                             mult_expSum_f8[2][3:0], mult_frac3_f8[2], 1'b0,
+                             mult_expSum_f8[1][3:0], mult_frac3_f8[1], 1'b0,
+                             mult_expSum_f8[0][3:0], mult_frac3_f8[0] };
+        endcase
     end
 
     // --- FPMult Rounding Logic ---
@@ -873,16 +931,30 @@ module FpAllShared(
     assign mult_round_h  = sigProdExt[40] & (sigProdExt[41] | (|sigProdExt[39:32]));
     assign mult_round_l  = sigProdExt[8]  & (sigProdExt[9]  | (|sigProdExt[7:0]));
 
-    // Select rounding carries for shared adder (ra_Cin for Low/FMT_FP32, mul_ra_Y for High)
-    assign mult_round = (fmt == FMT_FP32) ? mult_round_32 : mult_round_l;
-    assign mul_ra_Y   = (fmt == FMT_BF16) ? (31'(mult_round_h) << 16) : 31'd0;
+    // Select rounding carries for shared adder.
+    //   ra_Cin : FMT_FP32 -> round_32, FMT_BF16 -> round_l, FMT_FP8 -> lane0
+    //   mul_ra_Y : FMT_BF16 -> round_h<<16, FMT_FP8 -> lanes 1/2/3 round bits
+    assign mult_round = (fmt == FMT_FP32) ? mult_round_32 :
+                        (fmt == FMT_BF16) ? mult_round_l   :
+                                            mult_roundup_f8[0];
+    assign mul_ra_Y   = (fmt == FMT_BF16) ? (31'(mult_round_h) << 16) :
+                        (fmt == FMT_FP8)  ? ( (31'(mult_roundup_f8[1]) << 8)
+                                            | (31'(mult_roundup_f8[2]) << 16)
+                                            | (31'(mult_roundup_f8[3]) << 24) )
+                                          : 31'd0;
 
     // Connect to Shared Rounding Adder (31bit, area_opt同様)
     assign mul_ra_X = expSig[30:0];
 
     // Get result from Shared Rounding Adder
     assign expSigPostRound = ra_R[30:0];
-    assign mul_R = {sign_h, expSigPostRound};
+    // FP8x4: 4 lanes of {sign, exp(4), frac(3)} = 8b each
+    assign mul_R = (fmt == FMT_FP8) ?
+                   { mult_sign_f8[3], expSigPostRound[30:24],
+                     mult_sign_f8[2], expSigPostRound[22:16],
+                     mult_sign_f8[1], expSigPostRound[14:8],
+                     mult_sign_f8[0], expSigPostRound[6:0] }
+                 : {sign_h, expSigPostRound};
 
 
     // =================================================================================
