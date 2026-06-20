@@ -13,34 +13,43 @@ module FpAllShared(
     // for multiprecision
     // Design Policy:
     // When in FMT_FP32 mode, prioritize using the logic/resources associated with
-    // the high-order 16-bit lanes (FMT_FP16 high part) to maximize sharing.
+    // the high-order 16-bit bf16x2 (FMT_BF16 high part) to maximize sharing.
     // ========================================================================
     FpVec_u x, y;
     assign x.raw = operandX;
     assign y.raw = operandY;
 
     // FPAdd signals
-    logic swap_h,swap_l;
+    logic [3:0] swap;
+
     logic [7:0] expDiff_h;
     logic [7:0] expDiff_l;
+    logic [3:0] expDiff_3, expDiff_2, expDiff_1, expDiff_0;  // FP8x4 per-lane exp diffs
+
     FpVec_u newX, newY;
     logic [7:0] add_expX_h,add_expX_l;
-    logic signX_h, signY_h, EffSub_h;
-    logic signX_l, signY_l, EffSub_l;
-    logic [23:0] mantissaY;
-    logic [7:0] mantissaY_h, mantissaY_l;
+    // Sign
+    logic [3:0] signX, signY;
+    // Effective subtraction
+    logic [3:0] EffSub;
+    logic [23:0] significandY;
+    logic [7:0] significandY_h, significandY_l;
+    logic [3:0] significandY3, significandY2, significandY1, significandY0;
     logic shiftedOut_h, shiftedOut_l;
+    logic shiftedOut_2, shiftedOut_1, shiftedOut_0;  // FP8x4 lanes (shiftedOut_h = lane3)
     logic [4:0] shiftVal_h_fp32;
     logic [3:0] shiftVal_h_fp16, shiftVal_l_fp16;
-    logic [7:0] shiftVal;
+    logic [2:0] shiftVal_3_fp8, shiftVal_2_fp8, shiftVal_1_fp8, shiftVal_0_fp8;
+    logic [11:0] shiftVal;
     logic [25:0] shiftedMantissaY;
-    logic add_sticky_h, add_sticky_l;
+    logic [3:0] add_sticky;
     logic [26:0] mantissaYpad, EffSub_Vector, mantissaYpadXorOp, mantissaXpad;
-    logic cInSigAdd_h, cInSigAdd_l;
+    logic [27:0] fracAddSum;
     logic [26:0] cin_vec;
     logic [26:0] fracAddResult;
     logic [27:0] fracSticky;
     logic [4:0] nZerosNew_l, nZerosNew_h;
+    logic [4:0] nZerosNew [4];   // per-lane LZC from Normalizer (count[3]=hi/FP32, count[0]=lo)
     logic [27:0] shiftedFrac;
     logic [13:0] shiftedFrac_h, shiftedFrac_l;
     logic [8:0] extendedExpInc_h, extendedExpInc_l;
@@ -52,6 +61,12 @@ module FpAllShared(
     logic [30:0] add_RoundedExpFrac;
     logic [31:0] add_R_fp32;
     logic [31:0] add_R_fp16;
+    logic [31:0] add_R_fp8;
+    // FP8x4 per-lane exponent update / rounding
+    logic [3:0] add_expX_f8 [4];
+    logic [4:0] updatedExp_f8 [4];
+    logic stk_f8 [4], rnd_f8 [4], lsb_f8 [4];
+    logic add_round_f8 [4];
 
     // FPMul signals
     logic sign_h;
@@ -441,71 +456,136 @@ module FpAllShared(
         .fmt(fmt),
         .operandX(x),
         .operandY(y),
-        .swapLo(swap_l),
-        .swapHi(swap_h)
+        .swap(swap)
     );
 
-    // assign swap = swaps[1]; // Currently forcing FMT_FP32 behavior for swap as the rest of the logic isn't updated yet.
     // input swap so that |operandX|>|operandY|
-    always_comb begin
-        newX.lanes.hi = (swap_h ==1'b0) ? x.lanes.hi : y.lanes.hi;
-        newY.lanes.hi = (swap_h ==1'b0) ? y.lanes.hi : x.lanes.hi;
+    //
+    // AbsComparator's swap[i] (= ~c[i]) is the magnitude-compare result of the
+    // *region* whose MSB byte is lane i. Because carries propagate across
+    // non-cut boundaries, only the top byte of each region carries the valid
+    // decision; the other bytes in the same region must reuse that same bit:
+    //   FMT_FP32 : one 32-bit region {L3,L2,L1,L0}        -> all use swap[3]
+    //   FMT_BF16 : two 16-bit regions {L3,L2},{L1,L0}     -> hi uses swap[3], lo uses swap[1]
+    //   FMT_FP8  : four 8-bit regions {L3},{L2},{L1},{L0} -> each uses its own swap[i]
+    logic swap_sel3, swap_sel2, swap_sel1, swap_sel0;
+    always_comb begin : swap_sel
+        swap_sel3 = swap[3];
+        swap_sel2 = (fmt == FMT_FP8)  ? swap[2] : swap[3];
+        swap_sel1 = (fmt == FMT_FP32) ? swap[3] : swap[1];
+        swap_sel0 = (fmt == FMT_FP32) ? swap[3] :
+                    (fmt == FMT_BF16) ? swap[1] : swap[0];
 
-    if(fmt ==FMT_FP32) begin
-            newX.lanes.lo = (swap_h ==1'b0) ? x.lanes.lo : y.lanes.lo;
-            newY.lanes.lo = (swap_h ==1'b0) ? y.lanes.lo : x.lanes.lo;
-    end else begin
-        newX.lanes.lo = (swap_l ==1'b0) ? x.lanes.lo : y.lanes.lo;
-        newY.lanes.lo = (swap_l ==1'b0) ? y.lanes.lo : x.lanes.lo;
-        end
+        newX.fp8x4.lane3 = (swap_sel3 == 1'b0) ? x.fp8x4.lane3 : y.fp8x4.lane3;
+        newY.fp8x4.lane3 = (swap_sel3 == 1'b0) ? y.fp8x4.lane3 : x.fp8x4.lane3;
+
+        newX.fp8x4.lane2 = (swap_sel2 == 1'b0) ? x.fp8x4.lane2 : y.fp8x4.lane2;
+        newY.fp8x4.lane2 = (swap_sel2 == 1'b0) ? y.fp8x4.lane2 : x.fp8x4.lane2;
+
+        newX.fp8x4.lane1 = (swap_sel1 == 1'b0) ? x.fp8x4.lane1 : y.fp8x4.lane1;
+        newY.fp8x4.lane1 = (swap_sel1 == 1'b0) ? y.fp8x4.lane1 : x.fp8x4.lane1;
+
+        newX.fp8x4.lane0 = (swap_sel0 == 1'b0) ? x.fp8x4.lane0 : y.fp8x4.lane0;
+        newY.fp8x4.lane0 = (swap_sel0 == 1'b0) ? y.fp8x4.lane0 : x.fp8x4.lane0;
+
     end
 
     /* Exponent Difference */
-    assign expDiff_h = newX.fp32.exp - newY.fp32.exp;
-    assign expDiff_l = newX.lanes.lo[14:7] - newY.lanes.lo[14:7]; //lo expDiff
+    // The two 8-bit subtractors are shared across formats. In FMT_FP8 each one
+    // packs two 4-bit lane exponents ({hiLane, loLane}). This is safe because the
+    // per-lane swap guarantees expX >= expY in every lane, so the low-nibble
+    // subtraction never borrows into the high nibble (no carry-chain cut needed).
+    always_comb begin : exponent_dif
+        expDiff_h = (fmt == FMT_FP8)
+            ? {newX.fp8x4.lane3[6:3], newX.fp8x4.lane2[6:3]}
+            - {newY.fp8x4.lane3[6:3], newY.fp8x4.lane2[6:3]}
+            : newX.fp32.exp - newY.fp32.exp;
+
+        expDiff_l = (fmt == FMT_FP8)
+            ? {newX.fp8x4.lane1[6:3], newX.fp8x4.lane0[6:3]}
+            - {newY.fp8x4.lane1[6:3], newY.fp8x4.lane0[6:3]}
+            : newX.bf16x2.lo[14:7] - newY.bf16x2.lo[14:7];
+
+        // FP8x4 per-lane exponent differences (sliced from the shared subtractors)
+        expDiff_3 = expDiff_h[7:4];
+        expDiff_2 = expDiff_h[3:0];
+        expDiff_1 = expDiff_l[7:4];
+        expDiff_0 = expDiff_l[3:0];
+    end
 
     /* Sign, Exponent, Fraction Decomposition */
-    assign signX_h = newX.fp32.sign;
-    assign signY_h = newY.fp32.sign;
-    assign signX_l = newX.lanes.lo[15];
-    assign signY_l = newY.lanes.lo[15];
+    always_comb begin
+        signX[3] = newX.fp32.sign;
+        signY[3] = newY.fp32.sign;
+        signX[2] = newX.fp8x4.lane2[7];
+        signY[2] = newY.fp8x4.lane2[7];
+        signX[1] = newX.bf16x2.lo[15];
+        signY[1] = newY.bf16x2.lo[15];
+        signX[0] = newX.fp8x4.lane0[7];
+        signY[0] = newY.fp8x4.lane0[7];
 
-    assign add_expX_h = newX.fp32.exp; // == newX.lanes.hi[14:8];
-    assign add_expX_l = newX.lanes.lo[14:7];
+        add_expX_h = newX.fp32.exp; // == newX.bf16x2.hi[14:8];
+        add_expX_l = newX.bf16x2.lo[14:7];
 
-    assign EffSub_h = signX_h ^ signY_h;
-    assign EffSub_l = signX_l ^ signY_l;
+        EffSub = signX ^ signY; // Calculate each sign bit
 
+        significandY_h = {1'b1, newY.bf16x2.hi[6:0]};
+        significandY_l = {1'b1, newY.bf16x2.lo[6:0]};
 
-    assign mantissaY_h = {1'b1, newY.lanes.hi[6:0]};
-    assign mantissaY_l = {1'b1, newY.lanes.lo[6:0]};
+        significandY3  = {1'b1, newY.fp8x4.lane3[2:0]};
+        significandY2  = {1'b1, newY.fp8x4.lane2[2:0]};
+        significandY1  = {1'b1, newY.fp8x4.lane1[2:0]};
+        significandY0  = {1'b1, newY.fp8x4.lane0[2:0]};
+    end
 
+    always_comb begin: shift
     // FMT_FP32 shift amount (cap at 26)
-    assign shiftedOut_h   = (|expDiff_h[7:5]); // expDiff_h > 31
-    assign shiftVal_h_fp32 = shiftedOut_h ? 5'd26 : expDiff_h[4:0];
+        shiftedOut_h    = (fmt == FMT_FP8) ? (expDiff_3 > 4'd5) : (|expDiff_h[7:5]); // expDiff_h > 31
+        shiftVal_h_fp32 = shiftedOut_h ? 5'd26 : expDiff_h[4:0];
 
-    // FMT_FP16 shift amount (cap at 10)
-    assign shiftedOut_l    = (expDiff_l > 9);
-    assign shiftVal_h_fp16 = (shiftedOut_h |expDiff_h[4]) ? 4'd10 : expDiff_h[3:0]; //expDiff_h > 16 (area -4)
-    assign shiftVal_l_fp16 = shiftedOut_l ? 4'd10 : expDiff_l[3:0];
+    // FMT_BF16 shift amount (cap at 10)
+        shiftedOut_l    = (expDiff_l > 9);
+        shiftVal_h_fp16 = (shiftedOut_h |expDiff_h[4]) ? 4'd10 : expDiff_h[3:0]; //expDiff_h > 16 (area -4)
+        shiftVal_l_fp16 = shiftedOut_l ? 4'd10 : expDiff_l[3:0];
+
+    // FMT_FP8 shift amount: 6-bit lane content (implicit @bit5), so a shift of 5
+    // still keeps the implicit bit (@bit0); only diff >= 6 fully flushes it into
+    // sticky. Cap at 6 for diff > 5.
+        shiftedOut_2 = (expDiff_2 > 4'd5);
+        shiftedOut_1 = (expDiff_1 > 4'd5);
+        shiftedOut_0 = (expDiff_0 > 4'd5);
+        shiftVal_3_fp8 = shiftedOut_h ? 3'd6 : expDiff_3[2:0];
+        shiftVal_2_fp8 = shiftedOut_2 ? 3'd6 : expDiff_2[2:0];
+        shiftVal_1_fp8 = shiftedOut_1 ? 3'd6 : expDiff_1[2:0];
+        shiftVal_0_fp8 = shiftedOut_0 ? 3'd6 : expDiff_0[2:0];
+    end
+
 
     always_comb begin
-    if (fmt == FMT_FP32) begin
-        shiftVal = {3'b0, shiftVal_h_fp32};
-        mantissaY    = {1'b1, newY[22:0]};
-    end else begin
-        shiftVal = {shiftVal_h_fp16, shiftVal_l_fp16};
-        mantissaY    = {mantissaY_h, 8'b0, mantissaY_l};
-    end
+        case (fmt)
+        FMT_FP32: begin
+            shiftVal     = {7'b0, shiftVal_h_fp32};
+            significandY   = {1'b1, newY[22:0]};
+        end
+        FMT_BF16: begin
+            shiftVal     = {4'b0, shiftVal_h_fp16, shiftVal_l_fp16};
+            significandY   = {significandY_h, 8'b0, significandY_l};
+        end
+        FMT_FP8: begin
+            shiftVal     = {shiftVal_3_fp8,shiftVal_2_fp8,shiftVal_1_fp8,shiftVal_0_fp8};
+            significandY = {significandY3, 2'b00, 1'b0, significandY2, 2'b00, significandY1, 2'b00, 1'b0, significandY0};
+            //               [23:20]        [19:18] [17] [16:13]       [12:11] [10:7]        [6:5]  [4]  [3:0]
+        end
+        default: ;
+        endcase
     end
 
     BarrelShifter right_shifter_component (
         .fmt(fmt),
         .shiftAmount(shiftVal),
-        .operandX(mantissaY),
+        .operandX(significandY),
         .result(shiftedMantissaY),
-        .stickyHi(add_sticky_h),
-        .stickyLo(add_sticky_l)
+        .sticky(add_sticky)
     );
     /* --- Significand Addition Prep --- */
 
@@ -514,36 +594,96 @@ module FpAllShared(
     // [26:16] Lane High: {padding(2), frac(7), guard, rnd}
     // [15:11] Gap/Zero:  {00000}
     // [10: 0] Lane Low:  {padding(2), frac(7), guard, rnd}
-    assign mantissaYpad = {1'b0, shiftedMantissaY}; // align to 27b adder input (MSB pad)
-    assign EffSub_Vector = (fmt == FMT_FP32) ? {27{EffSub_h}} : { {11{EffSub_h}}, 5'd0, {11{EffSub_l}} };
-    assign mantissaYpadXorOp = mantissaYpad ^ EffSub_Vector;
+    always_comb begin
+        // ---- Y significand placed into the 27b adder layout ----
+        // FP32/BF16 : {MSB pad, BarrelShifter output}.
+        // FP8       : re-map the BarrelShifter's 6b lanes into Normalizer-aligned
+        //             7b slots (L0=[6:0],L1=[13:7],L2=[20:14],L3=[26:21]).
+        //             Bits [6]/[13]/[20] are per-lane overflow/gap that isolate
+        //             adjacent lanes inside the shared 27b adder.
+        case (fmt)
+            FMT_FP8 : mantissaYpad = { shiftedMantissaY[25:20],
+                                       1'b0, shiftedMantissaY[18:13],
+                                       1'b0, shiftedMantissaY[12:7],
+                                       1'b0, shiftedMantissaY[5:0] };
+            default : mantissaYpad = {1'b0, shiftedMantissaY};
+        endcase
 
-    assign mantissaXpad =
-        (fmt ==FMT_FP32) ? {2'b01, newX[22:0], 2'b00}
-            : {{2'b01,newX.lanes.hi[6:0],2'b0}, 3'b0, 2'b0 , {2'b01, newX.lanes.lo[6:0],2'b0}};
-            // same bit layout as mantissaYpad
+        // ---- Effective-sub mask: flip only each lane's CONTENT bits ----
+        // The per-lane gap bit stays 0 so the 2's-complement carry stops there
+        // and never leaks into the neighbouring lane.
+        case (fmt)
+            FMT_FP32: EffSub_Vector = {27{EffSub[3]}};
+            FMT_BF16: EffSub_Vector = { {11{EffSub[3]}}, 5'b0, {11{EffSub[1]}} };
+            FMT_FP8 : EffSub_Vector = { {6{EffSub[3]}},
+                                        1'b0, {6{EffSub[2]}},
+                                        1'b0, {6{EffSub[1]}},
+                                        1'b0, {6{EffSub[0]}} };
+            default : EffSub_Vector = '0;
+        endcase
+        mantissaYpadXorOp = mantissaYpad ^ EffSub_Vector;
 
-    assign cInSigAdd_h = EffSub_h & (~add_sticky_h);
-    // if we subtract and the sticky was one, some of the negated sticky bits would have absorbed this carry
-    assign cInSigAdd_l = (fmt ==FMT_FP32) ? EffSub_h & (~add_sticky_l):  EffSub_l & (~add_sticky_l);
+        // ---- X significand: same lane layout as mantissaYpad ----
+        case (fmt)
+            FMT_FP32: mantissaXpad = {2'b01, newX[22:0], 2'b00};
+            FMT_BF16: mantissaXpad = { {2'b01, newX.bf16x2.hi[6:0], 2'b0}, 3'b0, 2'b0,
+                                       {2'b01, newX.bf16x2.lo[6:0], 2'b0} };
+            FMT_FP8 : mantissaXpad = { {1'b1, newX.fp8x4.lane3[2:0], 2'b00},
+                                       1'b0, {1'b1, newX.fp8x4.lane2[2:0], 2'b00},
+                                       1'b0, {1'b1, newX.fp8x4.lane1[2:0], 2'b00},
+                                       1'b0, {1'b1, newX.fp8x4.lane0[2:0], 2'b00} };
+            default : mantissaXpad = '0;
+        endcase
 
+        add_fracAdder_X = mantissaXpad;       // Connect padded operandX fraction
+        add_fracAdder_Y = mantissaYpadXorOp;  // Connect prepared operandY fraction
 
-    // Connect to Shared IntAdder_27 (TODO: not conneced now. separated from other op)
-    assign add_fracAdder_X = mantissaXpad;       // Connect padded operandX fraction
-    assign add_fracAdder_Y = mantissaYpadXorOp;  // Connect prepared operandY fraction
-
-    // Vectorize Carry-in for Shared Adder
-    assign cin_vec =
-    (fmt == FMT_FP16) ? ((27'(cInSigAdd_l)) | (27'(cInSigAdd_h) << 16))
-                :  (27'(cInSigAdd_l));
+        // ---- Per-lane carry-in for effective subtraction (x + ~y + 1) ----
+        // cin sits at each lane's content LSB; ~sticky absorbs the case where a
+        // shifted-out bit already consumed the +1.
+        case (fmt)
+            FMT_FP32: cin_vec = 27'(EffSub[3] & ~add_sticky[0]);
+            FMT_BF16: cin_vec = 27'(EffSub[1] & ~add_sticky[0])
+                              | (27'(EffSub[3] & ~add_sticky[2]) << 16);
+            FMT_FP8 : cin_vec = 27'(EffSub[0] & ~add_sticky[0])
+                              | (27'(EffSub[1] & ~add_sticky[1]) << 7)
+                              | (27'(EffSub[2] & ~add_sticky[2]) << 14)
+                              | (27'(EffSub[3] & ~add_sticky[3]) << 21);
+            default : cin_vec = '0;
+        endcase
+    end
 
     /* Execute Significand Addition/Subtraction */
-    assign fracAddResult = add_fracAdder_X + add_fracAdder_Y + cin_vec;
+    // 28b sum keeps the carry-out (FP8 lane3 overflow / general MSB overflow).
+    assign fracAddSum    = {1'b0, add_fracAdder_X} + {1'b0, add_fracAdder_Y} + {1'b0, cin_vec};
+    assign fracAddResult = fracAddSum[26:0];
 
     // Prepare Normalizer Input (Significand + Sticky)
     always_comb begin
-        fracSticky = {fracAddResult, add_sticky_l};
-        if(fmt ==FMT_FP16) fracSticky[16] = add_sticky_h;
+        case (fmt)
+            FMT_FP8 : begin
+                // adder 7b lanes -> Normalizer FP8 lanes (L0=[6:0],L1=[13:7],L2=[20:14],L3=[27:21])
+                fracSticky[6:0]   = fracAddResult[6:0];
+                fracSticky[13:7]  = fracAddResult[13:7];
+                fracSticky[20:14] = fracAddResult[20:14];
+                fracSticky[27:21] = {fracAddSum[27], fracAddResult[26:21]};
+                // pad/overflow bit is real only for effective-add; on effective-sub
+                // it merely holds the 2's-complement artifact, so clear it.
+                if (EffSub[0]) fracSticky[6]  = 1'b0;
+                if (EffSub[1]) fracSticky[13] = 1'b0;
+                if (EffSub[2]) fracSticky[20] = 1'b0;
+                if (EffSub[3]) fracSticky[27] = 1'b0;
+                // NOTE: the barrel-shifter sticky is NOT folded into the lane here.
+                // Normalization left-shifts the lane (by up to ~2 for FP8), which
+                // would carry a folded sticky into the guard position and corrupt
+                // rounding. Instead it is OR'd into the post-normalization sticky
+                // term (stk_f8) below.
+            end
+            default : begin
+                fracSticky = {fracAddResult, add_sticky[0]};
+                if (fmt == FMT_BF16) fracSticky[16] = add_sticky[2];
+            end
+        endcase
     end
 
     /* --- LZC and shifter --- */
@@ -551,10 +691,13 @@ module FpAllShared(
         .clk(clk),
         .fmt(fmt),
         .operandX(fracSticky),
-        .countHi(nZerosNew_h),
-        .countLo(nZerosNew_l),
+        .count(nZerosNew),
         .result(shiftedFrac)
     );
+
+    // hi-lane / FP32 use count[3]; lo-lane uses count[0]
+    assign nZerosNew_h = nZerosNew[3];
+    assign nZerosNew_l = nZerosNew[0];
 
     // Exponent Update
     assign extendedExpInc_h = {1'b0, add_expX_h} + 9'd1;
@@ -565,6 +708,16 @@ module FpAllShared(
     assign updatedExp_h = extendedExpInc_h - normShift_h;
     assign updatedExp_l = (fmt == FMT_FP32) ? 8'd0 : (extendedExpInc_l - normShift_l);
 
+    // FP8x4 per-lane exponent update: updatedExp = expX + 1 - leadingZeros
+    always_comb begin
+        add_expX_f8[3] = newX.fp8x4.lane3[6:3];
+        add_expX_f8[2] = newX.fp8x4.lane2[6:3];
+        add_expX_f8[1] = newX.fp8x4.lane1[6:3];
+        add_expX_f8[0] = newX.fp8x4.lane0[6:3];
+        for (int i = 0; i < 4; i++)
+            updatedExp_f8[i] = ({1'b0, add_expX_f8[i]} + 5'd1) - nZerosNew[i];
+    end
+
 
 
     /* --- rounding --- */
@@ -572,13 +725,20 @@ module FpAllShared(
     assign shiftedFrac_l = shiftedFrac[13:0];
 
     // FMT_FP32: exponent uses high lane, rounding uses low lane
+    // FMT_FP8 : 4 lanes of {exp(4),frac(3)} at [6:0]/[14:8]/[22:16]/[30:24], gaps [7]/[15]/[23]
     always_comb begin
-        add_expFrac = '0;
-        if (fmt ==FMT_FP32) begin
-            add_expFrac = {updatedExp_h, shiftedFrac_h[12:0], shiftedFrac_l[13:4]}; //[26:3] 暗黙は消えてる
-        end else begin
-            add_expFrac = {updatedExp_h, shiftedFrac_h[12:6],1'b0, updatedExp_l, shiftedFrac_l[10:4]}; //31bit
-        end
+        case (fmt)
+        FMT_FP32: add_expFrac = {updatedExp_h, shiftedFrac_h[12:0], shiftedFrac_l[13:4]}; //[26:3] 暗黙は消えてる
+        FMT_BF16: add_expFrac = {updatedExp_h, shiftedFrac_h[12:6],1'b0, updatedExp_l, shiftedFrac_l[10:4]}; //31bit
+        FMT_FP8 : add_expFrac = { updatedExp_f8[3][3:0], shiftedFrac[26:24],
+                                  1'b0,
+                                  updatedExp_f8[2][3:0], shiftedFrac[19:17],
+                                  1'b0,
+                                  updatedExp_f8[1][3:0], shiftedFrac[12:10],
+                                  1'b0,
+                                  updatedExp_f8[0][3:0], shiftedFrac[5:3] };
+        default : add_expFrac = '0;
+        endcase
     end
     assign stk_h = |shiftedFrac_h[4:2];
     assign rnd_h = shiftedFrac_h[5];
@@ -591,28 +751,54 @@ module FpAllShared(
     assign add_round_h = rnd_h & (stk_h | lsb_h);
     assign add_round_l = rnd_l & (stk_l | lsb_l);
 
+    // FP8x4 per-lane round bits (guard/round/sticky just below the kept 3-bit frac).
+    // The barrel-shifter sticky (bits Y lost to the right shift) always sits below
+    // every datapath bit, so it is OR'd straight into the sticky term here.
+    always_comb begin
+        lsb_f8[0] = shiftedFrac[3];  rnd_f8[0] = shiftedFrac[2];  stk_f8[0] = |shiftedFrac[1:0]  | add_sticky[0];
+        lsb_f8[1] = shiftedFrac[10]; rnd_f8[1] = shiftedFrac[9];  stk_f8[1] = |shiftedFrac[8:7]  | add_sticky[1];
+        lsb_f8[2] = shiftedFrac[17]; rnd_f8[2] = shiftedFrac[16]; stk_f8[2] = |shiftedFrac[15:14] | add_sticky[2];
+        lsb_f8[3] = shiftedFrac[24]; rnd_f8[3] = shiftedFrac[23]; stk_f8[3] = |shiftedFrac[22:21] | add_sticky[3];
+        for (int i = 0; i < 4; i++)
+            add_round_f8[i] = rnd_f8[i] & (stk_f8[i] | lsb_f8[i]);
+    end
+
     // Add: connect to Shared Rounding Adder
     assign round_vec =
-        (fmt == FMT_FP16) ? ((31'(add_round_l)) | (31'(add_round_h) << 16))
-                :  (31'(add_round_l));
+        (fmt == FMT_BF16) ? ((31'(add_round_l)) | (31'(add_round_h) << 16)) :
+        (fmt == FMT_FP8)  ? ( 31'(add_round_f8[0])
+                            | (31'(add_round_f8[1]) << 8)
+                            | (31'(add_round_f8[2]) << 16)
+                            | (31'(add_round_f8[3]) << 24))
+                          :  (31'(add_round_l));
     assign add_ra_X = add_expFrac;
     assign add_ra_Y = round_vec;
     assign add_RoundedExpFrac = ra_R[30:0];  // from Shared RA when opcode==FOP_ADD
 
     // Pack Result (Sign, Exponent, Mantissa)
     assign add_R_fp32 = {
-        signX_h,
+        signX[3],
         add_RoundedExpFrac   // exp + frac (FMT_FP32)
     };
 
     assign add_R_fp16 = {
-        signX_h,
+        signX[3],
         add_RoundedExpFrac[30:16], // exp+frac high lane
-        signX_l,
+        signX[1],
         add_RoundedExpFrac[14:0]   // exp+frac low lane
     };
 
-    assign add_R = (fmt == FMT_FP32) ? add_R_fp32 : add_R_fp16;
+    // FP8x4: 4 lanes of {sign, exp(4), frac(3)} = 8b each
+    assign add_R_fp8 = {
+        signX[3], add_RoundedExpFrac[30:24],
+        signX[2], add_RoundedExpFrac[22:16],
+        signX[1], add_RoundedExpFrac[14:8],
+        signX[0], add_RoundedExpFrac[6:0]
+    };
+
+    assign add_R = (fmt == FMT_FP32) ? add_R_fp32 :
+                   (fmt == FMT_BF16) ? add_R_fp16 :
+                                       add_R_fp8;
 
 
 
@@ -635,26 +821,26 @@ module FpAllShared(
     // assign expSumPreSub = {1'b0, mul_expAdder_R[8:0]}; // Get addition result
 
     assign expSumPreSub_h = mult_x.fp32.exp + mult_y.fp32.exp;
-    assign expSumPreSub_l = mult_x.lanes.lo[14:7] + mult_y.lanes.lo[14:7];
+    assign expSumPreSub_l = mult_x.bf16x2.lo[14:7] + mult_y.bf16x2.lo[14:7];
     assign bias = 9'd127;
     assign expSum_h = expSumPreSub_h - bias;
     assign expSum_l = expSumPreSub_l - bias;
 
     assign sigX =
         (fmt ==FMT_FP32) ? {2'b01, mult_x.fp32.frac}
-            : { {1'b1, mult_x.lanes.hi[6:0]}, 9'b0, {1'b1, mult_x.lanes.lo[6:0]}};
+            : { {1'b1, mult_x.bf16x2.hi[6:0]}, 9'b0, {1'b1, mult_x.bf16x2.lo[6:0]}};
 
     assign sigY =
         (fmt ==FMT_FP32) ? {2'b01, mult_y.fp32.frac}
-            : { {1'b1, mult_y.lanes.hi[6:0]}, 9'b0, {1'b1, mult_y.lanes.lo[6:0]}};
+            : { {1'b1, mult_y.bf16x2.hi[6:0]}, 9'b0, {1'b1, mult_y.bf16x2.lo[6:0]}};
     always_comb begin
         sigProd = sigX * sigY;
     end
 
 
     // exponent update
-    assign norm_h = (fmt ==FMT_FP16) ? sigProd[49] : sigProd[47]; // 1x.xx...
-    assign norm_l = (fmt ==FMT_FP16) ? sigProd[15]: 1'b0; // 1x.xx...
+    assign norm_h = (fmt ==FMT_BF16) ? sigProd[49] : sigProd[47]; // 1x.xx...
+    assign norm_l = (fmt ==FMT_BF16) ? sigProd[15]: 1'b0; // 1x.xx...
 
     assign expPostNorm_h = expSum_h + {7'd0, norm_h};
     assign expPostNorm_l = expSum_l + {7'd0, norm_l};
@@ -689,7 +875,7 @@ module FpAllShared(
 
     // Select rounding carries for shared adder (ra_Cin for Low/FMT_FP32, mul_ra_Y for High)
     assign mult_round = (fmt == FMT_FP32) ? mult_round_32 : mult_round_l;
-    assign mul_ra_Y   = (fmt == FMT_FP16) ? (31'(mult_round_h) << 16) : 31'd0;
+    assign mul_ra_Y   = (fmt == FMT_BF16) ? (31'(mult_round_h) << 16) : 31'd0;
 
     // Connect to Shared Rounding Adder (31bit, area_opt同様)
     assign mul_ra_X = expSig[30:0];
