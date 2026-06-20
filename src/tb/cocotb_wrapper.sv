@@ -152,3 +152,63 @@ module bf16_mult_wrapper (
 `endif
   assign o_prod = tmpResult[15:0];
 endmodule
+
+// ============================================================================
+// FP8x4 add wrapper (8-bit lane interface, E4M3)
+// Drives lane0 with the test operand, ties the remaining lanes to 0 and
+// reads back lane0, mirroring the single-lane BF16 wrapper above.
+// ============================================================================
+module fp8_add_wrapper (
+  input   logic                 i_clk,
+  input   logic                 i_rst_n,
+  input   logic [FP8_WIDTH-1:0] i_operand_a,
+  input   logic [FP8_WIDTH-1:0] i_operand_b,
+  output  logic [FP8_WIDTH-1:0] o_sum
+);
+  logic [FP32_WIDTH-1:0] tmpResult;
+`ifdef FOUROPS
+  // 4Ops is FP32-only; FP8 is unsupported.
+  assign tmpResult = '0;
+`elsif MIXED_ADDMULT
+  // mixed_addmult supports FP32/BF16 only; FP8 is unsupported.
+  assign tmpResult = '0;
+`else // SIXOPS
+  FpAllShared u_dut (
+    .clk      (i_clk),
+    .opcode   (FOP_ADD),
+    .fmt      (FMT_FP8),
+    .operandX ({24'b0, i_operand_a}),
+    .operandY ({24'b0, i_operand_b}),
+    .result   (tmpResult)
+  );
+`endif
+  assign o_sum = tmpResult[7:0];
+endmodule
+
+// ============================================================================
+// FP8x4 mult wrapper (8-bit lane interface, E4M3)
+// ============================================================================
+module fp8_mult_wrapper (
+  input   logic                 i_clk,
+  input   logic                 i_rst_n,
+  input   logic [FP8_WIDTH-1:0] i_a,
+  input   logic [FP8_WIDTH-1:0] i_b,
+  output  logic [FP8_WIDTH-1:0] o_prod
+);
+  logic [FP32_WIDTH-1:0] tmpResult;
+`ifdef FOUROPS
+  assign tmpResult = '0;
+`elsif MIXED_ADDMULT
+  assign tmpResult = '0;
+`else // SIXOPS
+  FpAllShared u_dut (
+    .clk      (i_clk),
+    .opcode   (FOP_MUL),
+    .fmt      (FMT_FP8),
+    .operandX ({24'b0, i_a}),
+    .operandY ({24'b0, i_b}),
+    .result   (tmpResult)
+  );
+`endif
+  assign o_prod = tmpResult[7:0];
+endmodule
