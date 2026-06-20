@@ -21,6 +21,13 @@ make -f Makefile.cocotb
 
 デフォルト: `SIM=xcelium`, `TARGET=6Ops`, `TEST_UNIT=fp32_add`
 
+### 波形表示(xrun)
+```
+XRUN_FLAGS := -v200x -64bit -sv -access +rwc -input "@run 150112ns; exit" -gui
+```
+にする
+
+
 ### パラメータ
 
 | 変数 | デフォルト | 説明 |
