@@ -183,6 +183,35 @@ module fp8_add_wrapper (
 endmodule
 
 // ============================================================================
+// FP8x4 mult wrapper (32-bit packed interface, E4M3)
+// Full 4-lane interface: lane3=[31:24], lane2=[23:16], lane1=[15:8], lane0=[7:0].
+// Exercises the shared 25x25 multiplier packing (lanes 3 & 1) as well as the
+// dedicated 4x4 multipliers (lanes 2 & 0).
+// ============================================================================
+module fp8x4_mult_wrapper (
+  input   logic                  i_clk,
+  input   logic                  i_rst_n,
+  input   logic [FP32_WIDTH-1:0] i_operand_a,
+  input   logic [FP32_WIDTH-1:0] i_operand_b,
+  output  logic [FP32_WIDTH-1:0] o_prod
+);
+`ifdef FOUROPS
+  assign o_prod = '0;
+`elsif MIXED_ADDMULT
+  assign o_prod = '0;
+`else // SIXOPS / FP8X4
+  FpAllShared u_dut (
+    .clk      (i_clk),
+    .opcode   (FOP_MUL),
+    .fmt      (FMT_FP8),
+    .operandX (i_operand_a),
+    .operandY (i_operand_b),
+    .result   (o_prod)
+  );
+`endif
+endmodule
+
+// ============================================================================
 // FP8x4 mult wrapper (8-bit lane interface, E4M3)
 // ============================================================================
 module fp8_mult_wrapper (
